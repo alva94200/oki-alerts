@@ -1,0 +1,12 @@
+{
+  "name": "oki-alerts",
+  "version": "1.0.0",
+  "description": "TradingView webhook to Telegram - Oki Trading Alerts",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
