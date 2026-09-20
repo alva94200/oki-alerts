@@ -1,12 +1,12 @@
 {
   "name": "oki-alerts",
-  "version": "1.0.0",
-  "description": "TradingView webhook to Telegram - Oki Trading Alerts",
+  "version": "2.0.0",
+  "description": "Oki Alerts V2 — TradingView → Claude AI → Telegram",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
   }
 }
