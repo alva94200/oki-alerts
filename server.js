@@ -92,7 +92,7 @@ Analyse ce signal et donne ton verdict.`;
                         resolve(result.content[0].text);
                     } else {
                         console.error('Claude API error:', res.statusCode, body);
-                        resolve(null); // null = fallback sans filtre
+                        resolve(null);
                     }
                 } catch (e) {
                     console.error('Claude parse error:', e.message);
@@ -103,7 +103,7 @@ Analyse ce signal et donne ton verdict.`;
 
         req.on('error', (err) => {
             console.error('Claude request error:', err.message);
-            resolve(null); // fallback
+            resolve(null);
         });
 
         req.setTimeout(15000, () => {
@@ -125,7 +125,6 @@ function formatVerdict(analysis, data) {
     const pair = data.pair || '?';
     const tf = data.tf || '?';
 
-    // Parser le verdict depuis la reponse Claude
     const isGO = analysis.includes('VERDICT: GO') && !analysis.includes('NO GO');
     const verdictEmoji = isGO ? '✅' : '❌';
     const verdictText = isGO ? 'GO' : 'NO GO';
@@ -147,13 +146,13 @@ function formatFallback(data) {
     const zone = data.zone || '?';
     const score = data.score || '?';
 
-    return `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/5
+    return `${emoji} *${dir} ${pair} ${tf}* -- Score ${score}/5
 
 Prix: \`${price}\`
 Biais: ${bias}
 Zone: ${zone}
 
-⚠️ _Analyse Claude indisponible — signal brut_`;
+⚠️ _Analyse Claude indisponible -- signal brut_`;
 }
 
 // ============================================================
@@ -224,24 +223,20 @@ const server = http.createServer(async (req, res) => {
                 const score = data.score || '?';
                 console.log(`[${new Date().toISOString()}] Signal: ${dir} ${pair} Score ${score}/5`);
 
-                // Si Claude API configuree -> analyser
                 if (ANTHROPIC_API_KEY) {
                     console.log('Analyse Claude en cours...');
                     const analysis = await callClaude(data);
 
                     if (analysis) {
-                        // Envoyer le verdict Claude
                         const verdictMsg = formatVerdict(analysis, data);
                         await sendTelegram(verdictMsg);
                         console.log('Verdict envoye:', analysis.includes('NO GO') ? 'NO GO' : 'GO');
                     } else {
-                        // Fallback : envoyer le signal brut
                         const fallbackMsg = formatFallback(data);
                         await sendTelegram(fallbackMsg);
                         console.log('Fallback envoye (Claude indisponible)');
                     }
                 } else {
-                    // Pas de cle API -> mode V1 (signal brut)
                     const rawMsg = formatFallback(data);
                     await sendTelegram(rawMsg);
                     console.log('Mode V1 (pas de cle Claude)');
@@ -258,7 +253,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Test endpoint — simule un signal
+    // Test endpoint
     if (req.method === 'GET' && req.url === '/test') {
         const testData = {
             signal: 'BUY',
@@ -303,7 +298,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
     console.log('========================================');
-    console.log('  OKI ALERTS V2 — Claude AI Filter');
+    console.log('  OKI ALERTS V2 -- Claude AI Filter');
     console.log('========================================');
     console.log(`Port: ${PORT}`);
     console.log(`Claude API: ${ANTHROPIC_API_KEY ? 'OK' : 'PAS CONFIGURE'}`);
@@ -313,7 +308,4 @@ server.listen(PORT, () => {
     console.log('  POST /webhook  -> TradingView signal');
     console.log('  GET  /test     -> Test simulation');
     console.log('========================================');
-});
-    console.log('Webhook URL: /webhook');
-    console.log('Bot Telegram:', TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'configure' : 'PAS CONFIGURE');
 });
