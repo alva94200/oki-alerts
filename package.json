@@ -1,7 +1,7 @@
 {
   "name": "oki-alerts",
-  "version": "2.0.0",
-  "description": "Oki Alerts V2 — TradingView → Claude AI → Telegram",
+  "version": "3.0.0",
+  "description": "Oki Alerts V3 — Hard Filter + Claude AI → Telegram (XAUUSD only)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
