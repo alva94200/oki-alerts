@@ -1,12 +1,8 @@
+
 // ============================================================
-// OKI ALERTS V3 — TradingView → Filtre Dur + Claude AI → Telegram
-// Corrections post-diagnostic 25/09/2026 :
-//   1. Filtre dur HTF/Bias/Struct AVANT Claude
-//   2. Prompt Claude strict (pas de "malgré")
-//   3. SL ATR x4 (plus ATR x3)
-//   4. TP conservateur (-10 pts)
-//   5. Risque fixe 0.01 lot (jamais 0.02)
-//   6. Filtre paire : XAUUSD uniquement
+// OKI ALERTS V3.1 — TradingView → Filtre Dur + Claude AI → Telegram
+// Compatible OKI Fusion v1.0 (scoring 7/7, Bias, OPR)
+// Corrections post-diagnostic + Fusion upgrade
 // Deploy sur Render.com (free tier)
 // ============================================================
 
@@ -25,15 +21,29 @@ const PORT = process.env.PORT || 3000;
 const ALLOWED_PAIRS = ['XAUUSD', 'GOLD'];
 
 // ============================================================
+// DETECTER TYPE D'ALERTE
+// ============================================================
+function getAlertType(data) {
+    const t = (data.alert_type || data.type || '').toLowerCase();
+    if (t === 'htf_flip') return 'htf_flip';
+    if (t === 'bias_fort') return 'bias_fort';
+    if (t === 'surveillance') return 'surveillance';
+    return 'signal';
+}
+
+// ============================================================
 // FILTRE DUR — Rejet AVANT Claude (économise des tokens)
+// Compatible Fusion v1.0 : scoring dynamique 5 ou 7
 // ============================================================
 function hardFilter(data) {
     const signal = (data.signal || data.dir || '').toUpperCase();
     const bias = (data.bias || '').toUpperCase();
     const zone = (data.zone || '').toUpperCase();
     const score = parseInt(data.score) || 0;
+    const maxscore = parseInt(data.maxscore) || 5;
     const struct = (data.struct || '').toUpperCase();
     const pair = (data.pair || '').toUpperCase();
+    const biasDir = (data.bias_dir || '').toUpperCase();
 
     // 1. Filtre paire — XAUUSD uniquement
     const pairAllowed = ALLOWED_PAIRS.some(p => pair.includes(p));
@@ -41,9 +51,10 @@ function hardFilter(data) {
         return { blocked: true, reason: `Paire ${pair} ignorée — XAUUSD uniquement` };
     }
 
-    // 2. Score minimum 4/5
-    if (score < 4) {
-        return { blocked: true, reason: `Score ${score}/5 insuffisant (minimum 4/5)` };
+    // 2. Score minimum dynamique : 4/5 (legacy) ou 5/7 (Fusion)
+    const minScore = maxscore >= 7 ? 5 : 4;
+    if (score < minScore) {
+        return { blocked: true, reason: `Score ${score}/${maxscore} insuffisant (minimum ${minScore}/${maxscore})` };
     }
 
     // 3. HTF Bias opposé au signal = NO GO
@@ -54,7 +65,17 @@ function hardFilter(data) {
         return { blocked: true, reason: `SELL bloqué — HTF Bias BULLISH (conflit direct)` };
     }
 
-    // 4. Zone inversée = NO GO
+    // 4. Bias directionnel Fusion opposé = NO GO
+    if (biasDir && biasDir !== '?' && biasDir !== 'NEUTRAL') {
+        if (signal === 'BUY' && biasDir === 'BEAR') {
+            return { blocked: true, reason: `BUY bloqué — Bias directionnel BEAR` };
+        }
+        if (signal === 'SELL' && biasDir === 'BULL') {
+            return { blocked: true, reason: `SELL bloqué — Bias directionnel BULL` };
+        }
+    }
+
+    // 5. Zone inversée = NO GO
     if (signal === 'BUY' && zone === 'PREMIUM') {
         return { blocked: true, reason: `BUY bloqué — zone PREMIUM (acheter en discount)` };
     }
@@ -62,7 +83,7 @@ function hardFilter(data) {
         return { blocked: true, reason: `SELL bloqué — zone DISCOUNT (vendre en premium)` };
     }
 
-    // 5. Structure opposée au signal = NO GO
+    // 6. Structure opposée au signal = NO GO
     if (signal === 'BUY' && struct === 'BEAR') {
         return { blocked: true, reason: `BUY bloqué — structure BEAR (trend opposé)` };
     }
@@ -74,50 +95,65 @@ function hardFilter(data) {
 }
 
 // ============================================================
-// PROMPT SYSTEME POUR CLAUDE — V3 strict
+// PROMPT SYSTEME POUR CLAUDE — V3.1 Fusion
 // ============================================================
 const SYSTEM_PROMPT = `Tu es Oki, un analyste trading SMC/ICT senior specialise sur le Gold (XAUUSD).
 
-TON ROLE : analyser chaque signal d'alerte TradingView et donner un verdict GO ou NO GO.
+TON ROLE : analyser chaque signal OKI Fusion v1.0 et donner un verdict GO ou NO GO.
+
+LE SIGNAL CONTIENT 7 CRITERES :
+1-5. SMC classiques : CHoCH/BOS, OB, FVG, Zone Premium/Discount, Kill Zone
+6. Bias directionnel (PDH/PDL, Weekly Open, DXY, Liquidity Sweep) — force 0 a 4
+7. OPR Sweep (NY Opening Range sweep detecte)
 
 REGLES ABSOLUES (aucune exception, aucun "malgre") :
-1. Score minimum 4/5. En dessous = NO GO automatique.
-2. Le biais HTF DOIT etre aligne avec la direction du signal. HTF oppose = NO GO. PAS DE "malgre structure opposee". PAS DE "correction attendue". Conflit = NO GO.
-3. La structure (trend) DOIT etre alignee avec le signal. Trend oppose = NO GO.
-4. Zone Premium/Discount : BUY en discount UNIQUEMENT, SELL en premium UNIQUEMENT. Inversion = NO GO.
-5. Kill Zone active (London ou New York) renforce le signal. Hors KZ = prudence accrue.
-6. Un OB avec freshness > 50% renforce. OB < 25% = faiblesse.
+1. Score minimum 5/7. En dessous = NO GO automatique.
+2. Le biais HTF DOIT etre aligne avec le signal. HTF oppose = NO GO. PAS DE "malgre". Conflit = NO GO.
+3. Le bias directionnel DOIT etre aligne ou neutre. Oppose = NO GO.
+4. La structure (trend) DOIT etre alignee. Trend oppose = NO GO.
+5. Zone Premium/Discount : BUY en discount UNIQUEMENT, SELL en premium UNIQUEMENT.
+6. Kill Zone active (London/New York) renforce. Hors KZ = prudence accrue.
+7. OPR Sweep actif = bonus fort en session NY.
+8. Bias fort (3+/4) + OPR Sweep = setup A+ (confiance maximale).
 
 INTERDIT :
 - Dire GO avec une reserve ("malgre", "cependant", "toutefois")
 - Si tu hesites entre GO et NO GO = NO GO
-- Recommander 0.02 lot. TOUJOURS 0.01 lot.
+- Recommander plus de 0.01 lot. TOUJOURS 0.01 lot.
 
-FORMAT DE REPONSE (strict, pas de bavardage) :
+FORMAT DE REPONSE (strict) :
 VERDICT: GO ou NO GO
+GRADE: A+, A, B ou C
 CONFIANCE: 1 a 5 etoiles
 RAISON: une phrase max, directe, sans reserve
 ENTREE: prix exact du signal
 SL: ATR x4 (calcule le niveau exact)
-TP1: niveau (2R minimum) puis RETIRER 10 points du niveau calcule
-TP2: niveau (3R) puis RETIRER 10 points du niveau calcule
+TP1: niveau (2R minimum) puis RETIRER 10 points
+TP2: niveau (3R) puis RETIRER 10 points
 RISQUE: 0.01 lot (toujours)
 
-Si le signal est un NO GO, donne la raison claire et courte.
-Reponds UNIQUEMENT dans ce format, rien d'autre.`;
+GRADING :
+- A+ : Score 7/7, bias fort (3+/4), OPR sweep — trade parfait
+- A : Score 6/7, bias aligne, KZ active — tres bon setup
+- B : Score 5/7, conditions correctes — trade standard
+- C : Score <5/7 — NO GO
+
+Reponds UNIQUEMENT dans ce format.`;
 
 // ============================================================
 // APPELER CLAUDE API
 // ============================================================
 function callClaude(signalData) {
-    const userMessage = `Signal TradingView recu :
+    const maxscore = signalData.maxscore || '7';
+
+    const userMessage = `Signal OKI Fusion v1.0 recu :
 - Direction : ${signalData.signal || signalData.dir || '?'}
 - Paire : ${signalData.pair || '?'}
 - Timeframe : ${signalData.tf || '?'}
 - Prix actuel : ${signalData.price || signalData.entry || '?'}
 - Biais HTF : ${signalData.bias || '?'}
 - Zone : ${signalData.zone || '?'}
-- Score : ${signalData.score || '?'}/5
+- Score : ${signalData.score || '?'}/${maxscore}
 - Structure (Trend) : ${signalData.struct || '?'}
 - Kill Zone : ${signalData.kz || '?'}
 - RSI : ${signalData.rsi || '?'}
@@ -125,12 +161,15 @@ function callClaude(signalData) {
 - OB testes : ${signalData.ob_testes || '?'}
 - OB freshness : ${signalData.ob_fresh || '?'}%
 - OB retests : ${signalData.ob_retests || '?'}
+- Bias direction : ${signalData.bias_dir || '?'}
+- Bias force : ${signalData.bias_str || '?'}/4
+- OPR Sweep : ${signalData.opr_sweep || 'non'}
 
 Analyse ce signal et donne ton verdict.`;
 
     const payload = JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 300,
+        max_tokens: 400,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: userMessage }]
     });
@@ -186,36 +225,52 @@ Analyse ce signal et donne ton verdict.`;
 // ============================================================
 // FORMATER LES MESSAGES TELEGRAM
 // ============================================================
+
+// Signal avec verdict Claude
 function formatVerdict(analysis, data) {
     const dir = data.signal || data.dir || '?';
     const pair = data.pair || '?';
     const tf = data.tf || '?';
+    const maxscore = data.maxscore || '7';
+    const score = data.score || '?';
+    const biasStr = data.bias_str || '?';
+    const oprSweep = data.opr_sweep === 'oui' || data.opr_sweep === true;
 
     const isGO = analysis.includes('VERDICT: GO') && !analysis.includes('NO GO');
     const verdictEmoji = isGO ? '✅' : '❌';
     const verdictText = isGO ? 'GO' : 'NO GO';
 
-    return `${verdictEmoji} *OKI VERDICT: ${verdictText}*
+    // Detect grade
+    let grade = '';
+    const gradeMatch = analysis.match(/GRADE:\s*(A\+|A|B|C)/i);
+    if (gradeMatch) grade = ` [${gradeMatch[1]}]`;
+
+    const oprBadge = oprSweep ? ' \u{1F534}OPR' : '';
+
+    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}
 
 ${analysis}
 
-_Signal: ${dir} ${pair} ${tf}_`;
+_Signal: ${dir} ${pair} ${tf} | Score ${score}/${maxscore} | Bias ${biasStr}/4_`;
 }
 
+// Signal bloqué par filtre dur
 function formatBlocked(reason, data) {
     const dir = data.signal || data.dir || '?';
     const pair = data.pair || '?';
     const tf = data.tf || '?';
     const score = data.score || '?';
+    const maxscore = data.maxscore || '7';
 
-    return `🚫 *SIGNAL BLOQUÉ*
+    return `\u{1F6AB} *SIGNAL BLOQUÉ*
 
 ${reason}
 
-_Signal: ${dir} ${pair} ${tf} — Score ${score}/5_
-_Filtre V3 actif — signal rejeté avant analyse Claude_`;
+_Signal: ${dir} ${pair} ${tf} — Score ${score}/${maxscore}_
+_Filtre V3.1 actif — signal rejeté avant analyse Claude_`;
 }
 
+// Signal sans Claude (fallback)
 function formatFallback(data) {
     const dir = data.signal || data.dir || '?';
     const emoji = dir === 'BUY' ? '\u{1F7E2}' : '\u{1F534}';
@@ -225,14 +280,57 @@ function formatFallback(data) {
     const bias = data.bias || '?';
     const zone = data.zone || '?';
     const score = data.score || '?';
+    const maxscore = data.maxscore || '7';
+    const biasDir = data.bias_dir || '?';
+    const biasStr = data.bias_str || '?';
+    const oprSweep = data.opr_sweep === 'oui' || data.opr_sweep === true;
 
-    return `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/5
+    let msg = `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/${maxscore}
 
 Prix: \`${price}\`
-Biais: ${bias}
+Biais HTF: ${bias}
 Zone: ${zone}
+Bias: ${biasDir} (${biasStr}/4)`;
 
-⚠️ _Analyse Claude indisponible — signal brut_`;
+    if (oprSweep) {
+        msg += `\n\u{1F534} OPR Sweep actif`;
+    }
+
+    msg += `\n\n⚠️ _Analyse Claude indisponible — signal brut_`;
+    return msg;
+}
+
+// Surveillance : HTF Flip
+function formatHTFFlip(data) {
+    const pair = data.pair || '?';
+    const newDir = data.new_dir || data.bias || '?';
+    const price = data.price || '?';
+    const tf = data.tf || '?';
+
+    return `\u{1F504} *SURVEILLANCE — HTF FLIP*
+
+Paire: *${pair}* (${tf})
+Nouveau biais: *${newDir}*
+Prix: \`${price}\`
+
+_Changement de direction HTF détecté — vérifier les setups_`;
+}
+
+// Surveillance : Bias Fort
+function formatBiasFort(data) {
+    const pair = data.pair || '?';
+    const biasDir = data.bias_dir || '?';
+    const biasStr = data.bias_str || '?';
+    const price = data.price || '?';
+
+    return `\u{1F525} *SURVEILLANCE — BIAS FORT*
+
+Paire: *${pair}*
+Direction: *${biasDir}*
+Force: *${biasStr}/4* confluences
+Prix: \`${price}\`
+
+_Bias fort détecté — chercher entrée alignée_`;
 }
 
 // ============================================================
@@ -283,9 +381,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            status: 'Oki Alerts V3 actif',
-            version: '3.0',
-            filtres: 'HTF/Bias/Struct/Zone/Score + paire XAUUSD only',
+            status: 'Oki Alerts V3.1 actif — Fusion compatible',
+            version: '3.1',
+            scoring: '7/7 (Fusion) ou 5/5 (legacy)',
+            filtres: 'HTF/Bias/BiasDir/Struct/Zone/Score + XAUUSD only',
+            surveillance: 'HTF Flip + Bias Fort',
             claude: ANTHROPIC_API_KEY ? 'configure' : 'PAS CONFIGURE',
             telegram: TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'configure' : 'PAS CONFIGURE'
         }));
@@ -299,26 +399,46 @@ const server = http.createServer(async (req, res) => {
         req.on('end', async () => {
             try {
                 const data = JSON.parse(body);
+                const alertType = getAlertType(data);
                 const dir = data.signal || data.dir || '?';
                 const pair = data.pair || '?';
                 const score = data.score || '?';
-                console.log(`[${new Date().toISOString()}] Signal reçu: ${dir} ${pair} Score ${score}/5`);
+                const maxscore = data.maxscore || '7';
 
-                // ── FILTRE DUR V3 ──
+                console.log(`[${new Date().toISOString()}] Type: ${alertType} | ${dir} ${pair} Score ${score}/${maxscore}`);
+
+                // ── ALERTES SURVEILLANCE (pas de filtre, pas de Claude, envoi direct) ──
+                if (alertType === 'htf_flip') {
+                    const msg = formatHTFFlip(data);
+                    await sendTelegram(msg);
+                    console.log('Surveillance HTF Flip envoyee');
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, type: 'htf_flip' }));
+                    return;
+                }
+
+                if (alertType === 'bias_fort') {
+                    const msg = formatBiasFort(data);
+                    await sendTelegram(msg);
+                    console.log('Surveillance Bias Fort envoyee');
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, type: 'bias_fort' }));
+                    return;
+                }
+
+                // ── FILTRE DUR V3.1 ──
                 const filter = hardFilter(data);
                 if (filter.blocked) {
                     console.log(`[BLOQUÉ] ${filter.reason}`);
 
-                    // Notification silencieuse pour paires non-autorisées
                     if (filter.reason.includes('ignorée')) {
                         console.log('Paire ignorée — pas de notification Telegram');
                     } else {
-                        // Notifier le blocage sur Telegram (pour transparence)
                         await sendTelegram(formatBlocked(filter.reason, data));
                     }
 
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, version: 'v3', blocked: true, reason: filter.reason }));
+                    res.end(JSON.stringify({ ok: true, version: 'v3.1', blocked: true, reason: filter.reason }));
                     return;
                 }
 
@@ -330,7 +450,8 @@ const server = http.createServer(async (req, res) => {
                     if (analysis) {
                         const verdictMsg = formatVerdict(analysis, data);
                         await sendTelegram(verdictMsg);
-                        console.log('Verdict envoyé:', analysis.includes('NO GO') ? 'NO GO' : 'GO');
+                        const isGO = analysis.includes('VERDICT: GO') && !analysis.includes('NO GO');
+                        console.log('Verdict envoyé:', isGO ? 'GO' : 'NO GO');
                     } else {
                         const fallbackMsg = formatFallback(data);
                         await sendTelegram(fallbackMsg);
@@ -339,11 +460,11 @@ const server = http.createServer(async (req, res) => {
                 } else {
                     const rawMsg = formatFallback(data);
                     await sendTelegram(rawMsg);
-                    console.log('Mode V1 (pas de clé Claude)');
+                    console.log('Mode brut (pas de clé Claude)');
                 }
 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: true, version: 'v3' }));
+                res.end(JSON.stringify({ ok: true, version: 'v3.1' }));
             } catch (err) {
                 console.error('Erreur:', err.message);
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -353,28 +474,31 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Test endpoint
+    // Test signal Fusion
     if (req.method === 'GET' && req.url === '/test') {
         const testData = {
             signal: 'BUY',
             pair: 'XAUUSD',
             tf: '15',
-            price: '4280.50',
+            price: '2650.50',
             bias: 'BULLISH',
             zone: 'DISCOUNT',
-            score: '4',
+            score: '6',
+            maxscore: '7',
             struct: 'BULL',
-            kz: 'LONDON',
+            kz: 'NEW_YORK',
             rsi: '42',
             ob_actifs: '3',
             ob_testes: '1',
-            ob_fresh: '100',
-            ob_retests: '0'
+            ob_fresh: '85',
+            ob_retests: '0',
+            bias_dir: 'BULL',
+            bias_str: '3',
+            opr_sweep: 'oui'
         };
 
-        console.log('[TEST] Simulation signal BUY XAUUSD...');
+        console.log('[TEST] Simulation signal Fusion BUY XAUUSD 6/7...');
 
-        // Test du filtre dur d'abord
         const filter = hardFilter(testData);
         if (filter.blocked) {
             console.log(`[TEST BLOQUÉ] ${filter.reason}`);
@@ -403,7 +527,26 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Test filtre — pour vérifier les blocages sans envoyer sur Telegram
+    // Test surveillance
+    if (req.method === 'GET' && req.url === '/test-surv') {
+        console.log('[TEST] Simulation alertes surveillance...');
+        try {
+            await sendTelegram(formatHTFFlip({
+                pair: 'XAUUSD', new_dir: 'BEARISH', price: '2600.00', tf: 'H1'
+            }));
+            await sendTelegram(formatBiasFort({
+                pair: 'XAUUSD', bias_dir: 'BULL', bias_str: '3', price: '2580.00'
+            }));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, test: 'surveillance' }));
+        } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+    }
+
+    // Test filtre seul
     if (req.method === 'POST' && req.url === '/test-filter') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -428,22 +571,27 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
     console.log('========================================');
-    console.log('  OKI ALERTS V3 — Filtre Dur + Claude');
+    console.log('  OKI ALERTS V3.1 — Fusion Compatible');
     console.log('========================================');
     console.log(`Port: ${PORT}`);
+    console.log(`Scoring: 7/7 (Fusion) ou 5/5 (legacy)`);
     console.log(`Claude API: ${ANTHROPIC_API_KEY ? 'OK' : 'PAS CONFIGURE'}`);
     console.log(`Telegram: ${TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'OK' : 'PAS CONFIGURE'}`);
     console.log(`Paires: ${ALLOWED_PAIRS.join(', ')}`);
-    console.log('Filtres actifs:');
+    console.log('Filtres:');
     console.log('  - Paire autorisée uniquement');
-    console.log('  - Score minimum 4/5');
-    console.log('  - HTF Bias aligné obligatoire');
-    console.log('  - Structure/Trend alignée obligatoire');
+    console.log('  - Score minimum dynamique (5/7 ou 4/5)');
+    console.log('  - HTF Bias + Bias Dir alignés');
+    console.log('  - Structure/Trend alignée');
     console.log('  - Zone Premium/Discount correcte');
+    console.log('Surveillance:');
+    console.log('  - HTF Flip (changement direction)');
+    console.log('  - Bias Fort (3+/4 confluences)');
     console.log('Endpoints:');
-    console.log('  GET  /            -> Health check');
-    console.log('  POST /webhook     -> TradingView signal');
-    console.log('  GET  /test        -> Test simulation');
+    console.log('  GET  /           -> Health check');
+    console.log('  POST /webhook    -> Signal TradingView');
+    console.log('  GET  /test       -> Test signal Fusion');
+    console.log('  GET  /test-surv  -> Test surveillance');
     console.log('  POST /test-filter -> Test filtre seul');
     console.log('========================================');
 });
