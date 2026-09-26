@@ -58,8 +58,8 @@ function hardFilter(data) {
         return { blocked: true, reason: `Paire ${pair} ignorée — XAUUSD uniquement` };
     }
 
-    // 2. Score minimum dynamique : 4/5 (legacy) ou 5/7 (Fusion)
-    const minScore = maxscore >= 7 ? 5 : 4;
+    // 2. Score minimum dynamique : 3/5 (legacy) ou 4/7 (Fusion)
+    const minScore = maxscore >= 7 ? 4 : 3;
     if (score < minScore) {
         return { blocked: true, reason: `Score ${score}/${maxscore} insuffisant (minimum ${minScore}/${maxscore})` };
     }
@@ -114,14 +114,14 @@ LE SIGNAL CONTIENT 7 CRITERES :
 7. OPR Sweep (NY Opening Range sweep detecte)
 
 REGLES ABSOLUES (aucune exception, aucun "malgre") :
-1. Score minimum 5/7. En dessous = NO GO automatique.
-2. Le biais HTF DOIT etre aligne avec le signal. HTF oppose = NO GO. PAS DE "malgre". Conflit = NO GO.
-3. Le bias directionnel DOIT etre aligne ou neutre. Oppose = NO GO.
-4. La structure (trend) DOIT etre alignee. Trend oppose = NO GO.
-5. Zone Premium/Discount : BUY en discount UNIQUEMENT, SELL en premium UNIQUEMENT.
-6. Kill Zone active (London/New York) renforce. Hors KZ = prudence accrue.
-7. OPR Sweep actif = bonus fort en session NY.
-8. Bias fort (3+/4) + OPR Sweep = setup A+ (confiance maximale).
+1. Le biais HTF DOIT etre aligne avec le signal. HTF oppose = NO GO. PAS DE "malgre". Conflit = NO GO.
+2. Le bias directionnel DOIT etre aligne ou neutre. Oppose = NO GO.
+3. La structure (trend) DOIT etre alignee. Trend oppose = NO GO.
+4. Zone Premium/Discount : BUY en discount UNIQUEMENT, SELL en premium UNIQUEMENT.
+5. Kill Zone active (London/New York) renforce. Hors KZ = prudence accrue.
+6. OPR Sweep actif = bonus fort en session NY.
+7. Bias fort (3+/4) + OPR Sweep = setup A+ (confiance maximale).
+8. OB Freshness >= 80% renforce la confiance. < 50% = prudence.
 
 INTERDIT :
 - Dire GO avec une reserve ("malgre", "cependant", "toutefois")
@@ -130,7 +130,7 @@ INTERDIT :
 
 FORMAT DE REPONSE (strict) :
 VERDICT: GO ou NO GO
-GRADE: A+, A, B ou C
+GRADE: A+, A, B, C ou D
 CONFIANCE: 1 a 5 etoiles
 RAISON: une phrase max, directe, sans reserve
 ENTREE: prix exact du signal
@@ -139,11 +139,12 @@ TP1: 2R minimum (distance SL x 2 depuis entree). Affiche le niveau exact.
 TP2: 3R (distance SL x 3 depuis entree). Affiche le niveau exact.
 RISQUE: 0.01 lot (toujours)
 
-GRADING :
-- A+ : Score 7/7, bias fort (3+/4), OPR sweep — trade parfait
-- A : Score 6/7, bias aligne, KZ active — tres bon setup
-- B : Score 5/7, conditions correctes — trade standard
-- C : Score <5/7 — NO GO
+GRADING (large, Claude decide GO/NO GO selon le contexte) :
+- A+ : Score 7/7, bias fort (3+/4), OPR sweep — trade parfait, GO
+- A  : Score 6/7, bias aligne, KZ active — tres bon setup, GO
+- B  : Score 5/7, conditions correctes — bon setup, GO
+- C  : Score 4/7, OB fresh + confluences partielles — acceptable SI le contexte est fort (OB 80%+, KZ active, bias aligne). GO ou NO GO selon analyse.
+- D  : Score 4/7 sans confluences fortes — setup faible, NO GO
 
 Reponds UNIQUEMENT dans ce format.`;
 
@@ -250,7 +251,7 @@ function formatVerdict(analysis, data) {
 
     // Detect grade
     let grade = '';
-    const gradeMatch = analysis.match(/GRADE:\s*(A\+|A|B|C)/i);
+    const gradeMatch = analysis.match(/GRADE:\s*(A\+|A|B|C|D)/i);
     if (gradeMatch) grade = ` [${gradeMatch[1]}]`;
 
     const oprBadge = oprSweep ? ' \u{1F534}OPR' : '';
@@ -391,8 +392,8 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({
             status: 'Oki Alerts V3.1 actif — Fusion compatible',
             version: '3.1',
-            scoring: '7/7 (Fusion) ou 5/5 (legacy)',
-            filtres: 'HTF/Bias/BiasDir/Struct/Zone/Score + XAUUSD only',
+            scoring: '7/7 (Fusion) — min 4/7, grading A+ A B C D',
+            filtres: 'HTF/Bias/BiasDir/Struct/Zone/Score(4+) + XAUUSD only',
             surveillance: 'HTF Flip + Bias Fort',
             claude: ANTHROPIC_API_KEY ? 'configure' : 'PAS CONFIGURE',
             telegram: TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'configure' : 'PAS CONFIGURE'
@@ -452,7 +453,7 @@ const server = http.createServer(async (req, res) => {
 
                 // ── ANALYSE CLAUDE (signal a passé le filtre dur) ──
                 if (ANTHROPIC_API_KEY) {
-                    console.log('Signal validé par filtre dur — analyse Claude en cours...');
+                    console.log(`Signal validé par filtre dur (${score}/${maxscore}) — analyse Claude en cours...`);
                     const analysis = await callClaude(data);
 
                     if (analysis) {
@@ -586,13 +587,13 @@ server.listen(PORT, () => {
     console.log('  OKI ALERTS V3.1 — Fusion Compatible');
     console.log('========================================');
     console.log(`Port: ${PORT}`);
-    console.log(`Scoring: 7/7 (Fusion) ou 5/5 (legacy)`);
+    console.log(`Scoring: 7/7 (Fusion) — min 4/7, grading A+/A/B/C/D`);
     console.log(`Claude API: ${ANTHROPIC_API_KEY ? 'OK' : 'PAS CONFIGURE'}`);
     console.log(`Telegram: ${TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'OK' : 'PAS CONFIGURE'}`);
     console.log(`Paires: ${ALLOWED_PAIRS.join(', ')}`);
     console.log('Filtres:');
     console.log('  - Paire autorisée uniquement');
-    console.log('  - Score minimum dynamique (5/7 ou 4/5)');
+    console.log('  - Score minimum 4/7 (Fusion) ou 3/5 (legacy)');
     console.log('  - HTF Bias + Bias Dir alignés');
     console.log('  - Structure/Trend alignée');
     console.log('  - Zone Premium/Discount correcte');
