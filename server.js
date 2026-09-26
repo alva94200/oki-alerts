@@ -1,6 +1,6 @@
 // ============================================================
 // OKI ALERTS V3.2 — TradingView → Filtre Dur + Claude AI → Telegram
-// V3.2 : TP/SL adaptatif selon OB Freshness (backteste 1 mois)
+// V3.2 : SL adaptatif (OB Freshness) + TP adaptatif (Score 2.1R-5.1R)
 // Compatible OKI Fusion v1.0 (scoring 7/7, Bias, OPR)
 // Corrections post-diagnostic + Fusion upgrade
 // Deploy sur Render.com (free tier)
@@ -103,7 +103,7 @@ function hardFilter(data) {
 }
 
 // ============================================================
-// PROMPT SYSTEME POUR CLAUDE — V3.2 Fusion (TP/SL adaptatif)
+// PROMPT SYSTEME POUR CLAUDE — V3.2 Fusion (SL=freshness, TP=score)
 // ============================================================
 const SYSTEM_PROMPT = `Tu es Oki, un analyste trading SMC/ICT senior specialise sur le Gold (XAUUSD).
 
@@ -142,28 +142,22 @@ CONFIANCE: 1 a 5 etoiles
 RAISON: une phrase max, directe, sans reserve
 ENTREE: prix exact du signal
 
-=== CALCUL SL/TP ADAPTATIF (selon OB Freshness) ===
+=== CALCUL SL/TP ===
 
-Le SL et les TP s'ajustent selon la freshness de l'OB :
+SL adaptatif selon OB Freshness :
+  OB 100% : SL = ATR x 1.2 (tight, zone vierge)
+  OB 80-99% : SL = ATR x 1.5 (standard)
+  OB 50-79% : SL = ATR x 1.8 (large)
+  OB < 50% : SL = ATR x 2.0 (tres large)
 
-Si OB Freshness = 100% (zone vierge) :
-  SL = ATR x 1.2 (tight car reaction forte attendue)
-  TP1 = 2.5R | TP2 = 4R (agressif)
+TP adaptatif selon le SCORE (R:R de 2.1 a 5.1) :
+  Score 4/7 : TP1 = 1.5R | TP2 = 2.1R
+  Score 5/7 : TP1 = 2.0R | TP2 = 3.1R
+  Score 6/7 : TP1 = 2.5R | TP2 = 4.1R
+  Score 7/7 : TP1 = 3.0R | TP2 = 5.1R
 
-Si OB Freshness = 80-99% :
-  SL = ATR x 1.5 (standard)
-  TP1 = 2R | TP2 = 3R (standard)
-
-Si OB Freshness = 50-79% :
-  SL = ATR x 1.8 (large, protection)
-  TP1 = 1.5R | TP2 = 2R (conservateur)
-
-Si OB Freshness < 50% :
-  SL = ATR x 2.0 (tres large)
-  TP1 = 1R seulement, PAS de TP2 (scalp rapide)
-
-BUY : SL = prix - (ATR x multiplicateur). TP = prix + (distance SL x ratio R).
-SELL : SL = prix + (ATR x multiplicateur). TP = prix - (distance SL x ratio R).
+Les niveaux SL/TP/RR sont PRE-CALCULES par l'indicateur et fournis dans le signal.
+Confirme-les ou ajuste legerement si necessaire.
 Affiche TOUJOURS les niveaux exacts.
 
 RISQUE: 0.01 lot (toujours)
@@ -175,9 +169,9 @@ GRADING (large, Claude decide GO/NO GO selon le contexte) :
 - C  : Score 4/7, OB fresh 80%+ ET (KZ active OU bias aligne) — acceptable, GO ou NO GO selon analyse.
 - D  : Score 4/7 sans OB 80% ou sans confluences — setup faible, NO GO
 
-BONUS FRESHNESS :
-- Un OB 100% peut UPGRADER un grade d'un cran (C → B, B → A).
-- Un OB < 50% DOWNGRADE d'un cran (B → C, A → B) et exige TP conservateurs.
+BONUS :
+- OB 100% peut UPGRADER un grade d'un cran (C → B, B → A).
+- OB < 50% DOWNGRADE d'un cran (B → C, A → B).
 
 Reponds UNIQUEMENT dans ce format.`;
 
@@ -210,9 +204,9 @@ function callClaude(signalData) {
 - SL pre-calcule : ${signalData.sl || '?'}
 - TP1 pre-calcule : ${signalData.tp1 || '?'}
 - TP2 pre-calcule : ${signalData.tp2 || '?'}
-- Mode TP : ${signalData.tp_mode || '?'}
+- R:R max : ${signalData.rr || '?'}
 
-Analyse ce signal. Les niveaux SL/TP sont deja calcules par l'indicateur selon la freshness OB.
+Analyse ce signal. SL/TP/RR sont pre-calcules (SL selon OB freshness, TP selon score).
 Confirme ou ajuste si necessaire. Donne ton verdict.`;
 
     const payload = JSON.stringify({
@@ -295,7 +289,7 @@ function formatVerdict(analysis, data) {
 
     const oprBadge = oprSweep ? ' \u{1F534}OPR' : '';
 
-    // OB Freshness badge + TP mode
+    // OB Freshness badge
     const obFresh = parseInt(data.ob_fresh) || 0;
     let freshBadge = '';
     if (obFresh >= 100) freshBadge = ' 💎OB100%';
@@ -303,7 +297,11 @@ function formatVerdict(analysis, data) {
     else if (obFresh >= 50) freshBadge = ' 🟡OB' + obFresh + '%';
     else if (obFresh > 0) freshBadge = ' 🔴OB' + obFresh + '%';
 
-    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}
+    // R:R badge
+    const rr = data.rr || '';
+    const rrBadge = rr ? ` | ${rr}R` : '';
+
+    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}${rrBadge}
 
 ${analysis}
 
@@ -439,7 +437,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({
             status: 'Oki Alerts V3.2 actif — Fusion compatible',
             version: '3.2',
-            scoring: '7/7 (Fusion) — min 4/7, grading A+ A B C D, TP/SL adaptatif OB freshness',
+            scoring: '7/7 (Fusion) — min 4/7, grading A+ A B C D, SL=freshness TP=score 2.1-5.1R',
             filtres: 'HTF/Bias/BiasDir/Struct/Zone/Score(4+) + XAUUSD only',
             surveillance: 'HTF Flip + Bias Fort',
             claude: ANTHROPIC_API_KEY ? 'configure' : 'PAS CONFIGURE',
@@ -555,7 +553,7 @@ const server = http.createServer(async (req, res) => {
             sl: '2635.50',
             tp1: '2688.00',
             tp2: '2706.50',
-            tp_mode: 'STANDARD'
+            rr: '4.1'
         };
 
         console.log('[TEST] Simulation signal Fusion BUY XAUUSD 6/7...');
