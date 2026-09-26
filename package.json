@@ -1,7 +1,7 @@
 {
   "name": "oki-alerts",
-  "version": "3.0.0",
-  "description": "Oki Alerts V3 — Hard Filter + Claude AI → Telegram (XAUUSD only)",
+  "version": "3.1.0",
+  "description": "Oki Alerts V3.1 — Fusion Compatible (7/7 scoring, Bias, OPR, Surveillance)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
