@@ -134,9 +134,9 @@ GRADE: A+, A, B ou C
 CONFIANCE: 1 a 5 etoiles
 RAISON: une phrase max, directe, sans reserve
 ENTREE: prix exact du signal
-SL: ATR x4 (calcule le niveau exact)
-TP1: niveau (2R minimum) puis RETIRER 10 points
-TP2: niveau (3R) puis RETIRER 10 points
+SL: prix ± (ATR x 1.5). BUY = prix - SL. SELL = prix + SL. Affiche le niveau exact.
+TP1: 2R minimum (distance SL x 2 depuis entree). Affiche le niveau exact.
+TP2: 3R (distance SL x 3 depuis entree). Affiche le niveau exact.
 RISQUE: 0.01 lot (toujours)
 
 GRADING :
@@ -171,8 +171,9 @@ function callClaude(signalData) {
 - Bias direction : ${signalData.bias_dir || '?'}
 - Bias force : ${signalData.bias_str || '?'}/4
 - OPR Sweep : ${signalData.opr_sweep && signalData.opr_sweep !== 'NONE' && signalData.opr_sweep !== 'non' ? signalData.opr_sweep : 'non'}
+- ATR(14) : ${signalData.atr || '?'}
 
-Analyse ce signal et donne ton verdict.`;
+Analyse ce signal et donne ton verdict. Calcule SL et TP avec l'ATR fourni.`;
 
     const payload = JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
@@ -501,7 +502,8 @@ const server = http.createServer(async (req, res) => {
             ob_retests: '0',
             bias_dir: 'BULL',
             bias_str: '3',
-            opr_sweep: 'oui'
+            opr_sweep: 'LOW',
+            atr: '12.50'
         };
 
         console.log('[TEST] Simulation signal Fusion BUY XAUUSD 6/7...');
