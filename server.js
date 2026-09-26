@@ -23,7 +23,15 @@ const ALLOWED_PAIRS = ['XAUUSD', 'GOLD'];
 // DETECTER TYPE D'ALERTE
 // ============================================================
 function getAlertType(data) {
+    const sig = (data.signal || '').toUpperCase();
     const t = (data.alert_type || data.type || '').toLowerCase();
+
+    // Fusion envoie signal:"SURVEILLANCE" + type:"HTF_FLIP" ou type:"BIAS_FORT"
+    if (sig === 'SURVEILLANCE') {
+        if (t === 'htf_flip') return 'htf_flip';
+        if (t === 'bias_fort') return 'bias_fort';
+        return 'surveillance';
+    }
     if (t === 'htf_flip') return 'htf_flip';
     if (t === 'bias_fort') return 'bias_fort';
     if (t === 'surveillance') return 'surveillance';
@@ -162,7 +170,7 @@ function callClaude(signalData) {
 - OB retests : ${signalData.ob_retests || '?'}
 - Bias direction : ${signalData.bias_dir || '?'}
 - Bias force : ${signalData.bias_str || '?'}/4
-- OPR Sweep : ${signalData.opr_sweep || 'non'}
+- OPR Sweep : ${signalData.opr_sweep && signalData.opr_sweep !== 'NONE' && signalData.opr_sweep !== 'non' ? signalData.opr_sweep : 'non'}
 
 Analyse ce signal et donne ton verdict.`;
 
@@ -233,7 +241,7 @@ function formatVerdict(analysis, data) {
     const maxscore = data.maxscore || '7';
     const score = data.score || '?';
     const biasStr = data.bias_str || '?';
-    const oprSweep = data.opr_sweep === 'oui' || data.opr_sweep === true;
+    const oprSweep = data.opr_sweep && data.opr_sweep !== 'NONE' && data.opr_sweep !== 'non' && data.opr_sweep !== 'false';
 
     const isGO = analysis.includes('VERDICT: GO') && !analysis.includes('NO GO');
     const verdictEmoji = isGO ? '✅' : '❌';
@@ -282,7 +290,7 @@ function formatFallback(data) {
     const maxscore = data.maxscore || '7';
     const biasDir = data.bias_dir || '?';
     const biasStr = data.bias_str || '?';
-    const oprSweep = data.opr_sweep === 'oui' || data.opr_sweep === true;
+    const oprSweep = data.opr_sweep && data.opr_sweep !== 'NONE' && data.opr_sweep !== 'non' && data.opr_sweep !== 'false';
 
     let msg = `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/${maxscore}
 
@@ -302,7 +310,7 @@ Bias: ${biasDir} (${biasStr}/4)`;
 // Surveillance : HTF Flip
 function formatHTFFlip(data) {
     const pair = data.pair || '?';
-    const newDir = data.new_dir || data.bias || '?';
+    const newDir = data.new_dir || data.direction || data.bias || '?';
     const price = data.price || '?';
     const tf = data.tf || '?';
 
@@ -318,8 +326,8 @@ _Changement de direction HTF détecté — vérifier les setups_`;
 // Surveillance : Bias Fort
 function formatBiasFort(data) {
     const pair = data.pair || '?';
-    const biasDir = data.bias_dir || '?';
-    const biasStr = data.bias_str || '?';
+    const biasDir = data.bias_dir || data.direction || '?';
+    const biasStr = data.bias_str || data.strength || '?';
     const price = data.price || '?';
 
     return `\u{1F525} *SURVEILLANCE — BIAS FORT*
@@ -530,11 +538,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/test-surv') {
         console.log('[TEST] Simulation alertes surveillance...');
         try {
+            // Test format Fusion (direction au lieu de new_dir/bias_dir)
             await sendTelegram(formatHTFFlip({
-                pair: 'XAUUSD', new_dir: 'BEARISH', price: '2600.00', tf: 'H1'
+                signal: 'SURVEILLANCE', type: 'HTF_FLIP',
+                pair: 'XAUUSD', direction: 'BEAR', price: '2600.00', tf: 'H1'
             }));
             await sendTelegram(formatBiasFort({
-                pair: 'XAUUSD', bias_dir: 'BULL', bias_str: '3', price: '2580.00'
+                signal: 'SURVEILLANCE', type: 'BIAS_FORT',
+                pair: 'XAUUSD', direction: 'BULL', strength: '3/4', price: '2580.00'
             }));
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, test: 'surveillance' }));
