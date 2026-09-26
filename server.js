@@ -207,7 +207,13 @@ function callClaude(signalData) {
 - OPR Sweep : ${signalData.opr_sweep && signalData.opr_sweep !== 'NONE' && signalData.opr_sweep !== 'non' ? signalData.opr_sweep : 'non'}
 - ATR(14) : ${signalData.atr || '?'}
 
-Analyse ce signal et donne ton verdict. Calcule SL et TP avec l'ATR fourni.`;
+- SL pre-calcule : ${signalData.sl || '?'}
+- TP1 pre-calcule : ${signalData.tp1 || '?'}
+- TP2 pre-calcule : ${signalData.tp2 || '?'}
+- Mode TP : ${signalData.tp_mode || '?'}
+
+Analyse ce signal. Les niveaux SL/TP sont deja calcules par l'indicateur selon la freshness OB.
+Confirme ou ajuste si necessaire. Donne ton verdict.`;
 
     const payload = JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
@@ -545,7 +551,11 @@ const server = http.createServer(async (req, res) => {
             bias_dir: 'BULL',
             bias_str: '3',
             opr_sweep: 'LOW',
-            atr: '12.50'
+            atr: '12.50',
+            sl: '2635.50',
+            tp1: '2688.00',
+            tp2: '2706.50',
+            tp_mode: 'STANDARD'
         };
 
         console.log('[TEST] Simulation signal Fusion BUY XAUUSD 6/7...');
