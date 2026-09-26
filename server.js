@@ -1,5 +1,6 @@
 // ============================================================
-// OKI ALERTS V3.1 — TradingView → Filtre Dur + Claude AI → Telegram
+// OKI ALERTS V3.2 — TradingView → Filtre Dur + Claude AI → Telegram
+// V3.2 : TP/SL adaptatif selon OB Freshness (backteste 1 mois)
 // Compatible OKI Fusion v1.0 (scoring 7/7, Bias, OPR)
 // Corrections post-diagnostic + Fusion upgrade
 // Deploy sur Render.com (free tier)
@@ -102,7 +103,7 @@ function hardFilter(data) {
 }
 
 // ============================================================
-// PROMPT SYSTEME POUR CLAUDE — V3.1 Fusion
+// PROMPT SYSTEME POUR CLAUDE — V3.2 Fusion (TP/SL adaptatif)
 // ============================================================
 const SYSTEM_PROMPT = `Tu es Oki, un analyste trading SMC/ICT senior specialise sur le Gold (XAUUSD).
 
@@ -121,7 +122,13 @@ REGLES ABSOLUES (aucune exception, aucun "malgre") :
 5. Kill Zone active (London/New York) renforce. Hors KZ = prudence accrue.
 6. OPR Sweep actif = bonus fort en session NY.
 7. Bias fort (3+/4) + OPR Sweep = setup A+ (confiance maximale).
-8. OB Freshness >= 80% renforce la confiance. < 50% = prudence.
+
+=== OB FRESHNESS — REGLE CLE (backteste sur 1 mois) ===
+L'OB Freshness est le facteur #1 de reussite du trade.
+- OB 100% (vierge, 0 retests) = zone tres reactive, haute probabilite TP.
+- OB 80-99% = zone encore forte, bonne probabilite.
+- OB 50-79% = zone affaiblie, probabilite moyenne.
+- OB < 50% = zone epuisee, faible probabilite → prudence maximale.
 
 INTERDIT :
 - Dire GO avec une reserve ("malgre", "cependant", "toutefois")
@@ -134,17 +141,43 @@ GRADE: A+, A, B, C ou D
 CONFIANCE: 1 a 5 etoiles
 RAISON: une phrase max, directe, sans reserve
 ENTREE: prix exact du signal
-SL: prix ± (ATR x 1.5). BUY = prix - SL. SELL = prix + SL. Affiche le niveau exact.
-TP1: 2R minimum (distance SL x 2 depuis entree). Affiche le niveau exact.
-TP2: 3R (distance SL x 3 depuis entree). Affiche le niveau exact.
+
+=== CALCUL SL/TP ADAPTATIF (selon OB Freshness) ===
+
+Le SL et les TP s'ajustent selon la freshness de l'OB :
+
+Si OB Freshness = 100% (zone vierge) :
+  SL = ATR x 1.2 (tight car reaction forte attendue)
+  TP1 = 2.5R | TP2 = 4R (agressif)
+
+Si OB Freshness = 80-99% :
+  SL = ATR x 1.5 (standard)
+  TP1 = 2R | TP2 = 3R (standard)
+
+Si OB Freshness = 50-79% :
+  SL = ATR x 1.8 (large, protection)
+  TP1 = 1.5R | TP2 = 2R (conservateur)
+
+Si OB Freshness < 50% :
+  SL = ATR x 2.0 (tres large)
+  TP1 = 1R seulement, PAS de TP2 (scalp rapide)
+
+BUY : SL = prix - (ATR x multiplicateur). TP = prix + (distance SL x ratio R).
+SELL : SL = prix + (ATR x multiplicateur). TP = prix - (distance SL x ratio R).
+Affiche TOUJOURS les niveaux exacts.
+
 RISQUE: 0.01 lot (toujours)
 
 GRADING (large, Claude decide GO/NO GO selon le contexte) :
-- A+ : Score 7/7, bias fort (3+/4), OPR sweep — trade parfait, GO
-- A  : Score 6/7, bias aligne, KZ active — tres bon setup, GO
-- B  : Score 5/7, conditions correctes — bon setup, GO
-- C  : Score 4/7, OB fresh + confluences partielles — acceptable SI le contexte est fort (OB 80%+, KZ active, bias aligne). GO ou NO GO selon analyse.
-- D  : Score 4/7 sans confluences fortes — setup faible, NO GO
+- A+ : Score 7/7, bias fort (3+/4), OPR sweep, OB 80%+ — trade parfait, GO
+- A  : Score 6/7, bias aligne, KZ active, OB 80%+ — tres bon setup, GO
+- B  : Score 5/7, conditions correctes, OB 60%+ — bon setup, GO
+- C  : Score 4/7, OB fresh 80%+ ET (KZ active OU bias aligne) — acceptable, GO ou NO GO selon analyse.
+- D  : Score 4/7 sans OB 80% ou sans confluences — setup faible, NO GO
+
+BONUS FRESHNESS :
+- Un OB 100% peut UPGRADER un grade d'un cran (C → B, B → A).
+- Un OB < 50% DOWNGRADE d'un cran (B → C, A → B) et exige TP conservateurs.
 
 Reponds UNIQUEMENT dans ce format.`;
 
@@ -256,7 +289,15 @@ function formatVerdict(analysis, data) {
 
     const oprBadge = oprSweep ? ' \u{1F534}OPR' : '';
 
-    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}
+    // OB Freshness badge + TP mode
+    const obFresh = parseInt(data.ob_fresh) || 0;
+    let freshBadge = '';
+    if (obFresh >= 100) freshBadge = ' 💎OB100%';
+    else if (obFresh >= 80) freshBadge = ' 🟢OB' + obFresh + '%';
+    else if (obFresh >= 50) freshBadge = ' 🟡OB' + obFresh + '%';
+    else if (obFresh > 0) freshBadge = ' 🔴OB' + obFresh + '%';
+
+    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}
 
 ${analysis}
 
@@ -276,7 +317,7 @@ function formatBlocked(reason, data) {
 ${reason}
 
 _Signal: ${dir} ${pair} ${tf} — Score ${score}/${maxscore}_
-_Filtre V3.1 actif — signal rejeté avant analyse Claude_`;
+_Filtre V3.2 actif — signal rejeté avant analyse Claude_`;
 }
 
 // Signal sans Claude (fallback)
@@ -390,9 +431,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            status: 'Oki Alerts V3.1 actif — Fusion compatible',
-            version: '3.1',
-            scoring: '7/7 (Fusion) — min 4/7, grading A+ A B C D',
+            status: 'Oki Alerts V3.2 actif — Fusion compatible',
+            version: '3.2',
+            scoring: '7/7 (Fusion) — min 4/7, grading A+ A B C D, TP/SL adaptatif OB freshness',
             filtres: 'HTF/Bias/BiasDir/Struct/Zone/Score(4+) + XAUUSD only',
             surveillance: 'HTF Flip + Bias Fort',
             claude: ANTHROPIC_API_KEY ? 'configure' : 'PAS CONFIGURE',
@@ -435,7 +476,7 @@ const server = http.createServer(async (req, res) => {
                     return;
                 }
 
-                // ── FILTRE DUR V3.1 ──
+                // ── FILTRE DUR V3.2 ──
                 const filter = hardFilter(data);
                 if (filter.blocked) {
                     console.log(`[BLOQUÉ] ${filter.reason}`);
@@ -447,7 +488,7 @@ const server = http.createServer(async (req, res) => {
                     }
 
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, version: 'v3.1', blocked: true, reason: filter.reason }));
+                    res.end(JSON.stringify({ ok: true, version: 'v3.2', blocked: true, reason: filter.reason }));
                     return;
                 }
 
@@ -473,7 +514,7 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: true, version: 'v3.1' }));
+                res.end(JSON.stringify({ ok: true, version: 'v3.2' }));
             } catch (err) {
                 console.error('Erreur:', err.message);
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -584,7 +625,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
     console.log('========================================');
-    console.log('  OKI ALERTS V3.1 — Fusion Compatible');
+    console.log('  OKI ALERTS V3.2 — Fusion Compatible (TP/SL adaptatif)');
     console.log('========================================');
     console.log(`Port: ${PORT}`);
     console.log(`Scoring: 7/7 (Fusion) — min 4/7, grading A+/A/B/C/D`);
