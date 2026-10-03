@@ -1,13 +1,15 @@
 // ============================================================
-// OKI ALERTS V3.2 — TradingView → Filtre Dur + Claude AI → Telegram
-// V3.2 : SL adaptatif (OB Freshness) + TP adaptatif (Score 2.1R-5.1R)
-// Compatible OKI Fusion v1.0 (scoring 7/7, Bias, OPR)
-// Corrections post-diagnostic + Fusion upgrade
+// OKI ALERTS V4.0 — TradingView → Filtre + Claude AI → Telegram + Journal
+// V4.0 : Trade Journal auto + Compatibilité OKI Fusion v2.0 (scoring /10)
+// Nouveaux champs : fvg_conf, eql_sweep, delta, maxscore dynamique
+// Endpoints : /journal (historique), /stats (win rate, sessions)
 // Deploy sur Render.com (free tier)
 // ============================================================
 
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 // ============================================================
 // CONFIG
@@ -17,8 +19,77 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || 'TON_CHAT_ID_ICI';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const PORT = process.env.PORT || 3000;
 
-// Paires autorisées (tout le reste = ignoré)
 const ALLOWED_PAIRS = ['XAUUSD', 'GOLD'];
+
+// Journal file path (persiste sur Render dans /opt/render/project/src/)
+const JOURNAL_FILE = process.env.JOURNAL_FILE || path.join(__dirname, 'trade-journal.json');
+
+// ============================================================
+// TRADE JOURNAL — Lecture / Écriture
+// ============================================================
+function readJournal() {
+    try {
+        if (fs.existsSync(JOURNAL_FILE)) {
+            const raw = fs.readFileSync(JOURNAL_FILE, 'utf8');
+            return JSON.parse(raw);
+        }
+    } catch (e) {
+        console.error('Journal read error:', e.message);
+    }
+    return [];
+}
+
+function writeJournal(entries) {
+    try {
+        fs.writeFileSync(JOURNAL_FILE, JSON.stringify(entries, null, 2), 'utf8');
+    } catch (e) {
+        console.error('Journal write error:', e.message);
+    }
+}
+
+function logTrade(data, verdict, blocked, blockReason) {
+    const entries = readJournal();
+    const entry = {
+        id: entries.length + 1,
+        timestamp: new Date().toISOString(),
+        pair: data.pair || '?',
+        tf: data.tf || '?',
+        direction: (data.signal || data.dir || '?').toUpperCase(),
+        price: parseFloat(data.price || data.entry) || 0,
+        score: parseInt(data.score) || 0,
+        maxscore: parseInt(data.maxscore) || 7,
+        bias_htf: data.bias || '?',
+        trend: data.struct || '?',
+        zone: data.zone || '?',
+        kz: data.kz || 'OFF',
+        ob_fresh: parseInt(data.ob_fresh) || 0,
+        bias_dir: data.bias_dir || '?',
+        bias_str: parseInt(data.bias_str) || 0,
+        opr_sweep: data.opr_sweep || 'non',
+        atr: parseFloat(data.atr) || 0,
+        // V2.0 fields
+        fvg_conf: data.fvg_conf || '?',
+        eql_sweep: data.eql_sweep || 'non',
+        delta: data.delta || '?',
+        // Levels
+        sl: data.sl || '?',
+        tp1: data.tp1 || '?',
+        tp2: data.tp2 || '?',
+        rr: data.rr || '?',
+        // Verdict
+        verdict: verdict || 'N/A',
+        blocked: blocked || false,
+        block_reason: blockReason || '',
+        // Result — rempli manuellement via /result
+        result: 'PENDING',
+        pnl: 0,
+        notes: ''
+    };
+    entries.push(entry);
+    writeJournal(entries);
+    console.log(`[JOURNAL] Trade #${entry.id} logged: ${entry.direction} ${entry.pair} ${entry.score}/${entry.maxscore} — ${entry.verdict}`);
+    return entry;
+}
 
 // ============================================================
 // DETECTER TYPE D'ALERTE
@@ -27,7 +98,6 @@ function getAlertType(data) {
     const sig = (data.signal || '').toUpperCase();
     const t = (data.alert_type || data.type || '').toLowerCase();
 
-    // Fusion envoie signal:"SURVEILLANCE" + type:"HTF_FLIP" ou type:"BIAS_FORT"
     if (sig === 'SURVEILLANCE') {
         if (t === 'htf_flip') return 'htf_flip';
         if (t === 'bias_fort') return 'bias_fort';
@@ -40,40 +110,47 @@ function getAlertType(data) {
 }
 
 // ============================================================
-// FILTRE DUR — Rejet AVANT Claude (économise des tokens)
-// Compatible Fusion v1.0 : scoring dynamique 5 ou 7
+// FILTRE DUR V4.0 — Compatible v1.x (maxscore 7) et v2.0 (maxscore 10)
 // ============================================================
 function hardFilter(data) {
     const signal = (data.signal || data.dir || '').toUpperCase();
     const bias = (data.bias || '').toUpperCase();
     const zone = (data.zone || '').toUpperCase();
     const score = parseInt(data.score) || 0;
-    const maxscore = parseInt(data.maxscore) || 5;
+    const maxscore = parseInt(data.maxscore) || 7;
     const struct = (data.struct || '').toUpperCase();
     const pair = (data.pair || '').toUpperCase();
     const biasDir = (data.bias_dir || '').toUpperCase();
 
-    // 1. Filtre paire — XAUUSD uniquement
+    // 1. Filtre paire
     const pairAllowed = ALLOWED_PAIRS.some(p => pair.includes(p));
     if (!pairAllowed) {
         return { blocked: true, reason: `Paire ${pair} ignorée — XAUUSD uniquement` };
     }
 
-    // 2. Score minimum dynamique : 3/5 (legacy) ou 4/7 (Fusion)
-    const minScore = maxscore >= 7 ? 4 : 3;
+    // 2. Score minimum dynamique
+    //    v1.x (max 5): min 3 | v1.1 (max 7): min 4 | v2.0 (max 8-10): min 60%
+    let minScore;
+    if (maxscore <= 5) {
+        minScore = 3;
+    } else if (maxscore <= 7) {
+        minScore = 4;
+    } else {
+        minScore = Math.ceil(maxscore * 0.6); // 60% du max — 6/10, 5/8, etc.
+    }
     if (score < minScore) {
         return { blocked: true, reason: `Score ${score}/${maxscore} insuffisant (minimum ${minScore}/${maxscore})` };
     }
 
-    // 3. HTF Bias opposé au signal = NO GO
+    // 3. HTF Bias opposé = NO GO
     if (signal === 'BUY' && (bias.includes('BEAR') || bias === 'BEARISH')) {
-        return { blocked: true, reason: `BUY bloqué — HTF Bias BEARISH (conflit direct)` };
+        return { blocked: true, reason: `BUY bloqué — HTF Bias BEARISH` };
     }
     if (signal === 'SELL' && (bias.includes('BULL') || bias === 'BULLISH')) {
-        return { blocked: true, reason: `SELL bloqué — HTF Bias BULLISH (conflit direct)` };
+        return { blocked: true, reason: `SELL bloqué — HTF Bias BULLISH` };
     }
 
-    // 4. Bias directionnel Fusion opposé = NO GO
+    // 4. Bias directionnel opposé = NO GO
     if (biasDir && biasDir !== '?' && biasDir !== 'NEUTRAL') {
         if (signal === 'BUY' && biasDir === 'BEAR') {
             return { blocked: true, reason: `BUY bloqué — Bias directionnel BEAR` };
@@ -85,93 +162,94 @@ function hardFilter(data) {
 
     // 5. Zone inversée = NO GO
     if (signal === 'BUY' && zone === 'PREMIUM') {
-        return { blocked: true, reason: `BUY bloqué — zone PREMIUM (acheter en discount)` };
+        return { blocked: true, reason: `BUY bloqué — zone PREMIUM` };
     }
     if (signal === 'SELL' && zone === 'DISCOUNT') {
-        return { blocked: true, reason: `SELL bloqué — zone DISCOUNT (vendre en premium)` };
+        return { blocked: true, reason: `SELL bloqué — zone DISCOUNT` };
     }
 
-    // 6. Structure opposée au signal = NO GO
+    // 6. Structure opposée = NO GO
     if (signal === 'BUY' && struct === 'BEAR') {
-        return { blocked: true, reason: `BUY bloqué — structure BEAR (trend opposé)` };
+        return { blocked: true, reason: `BUY bloqué — structure BEAR` };
     }
     if (signal === 'SELL' && struct === 'BULL') {
-        return { blocked: true, reason: `SELL bloqué — structure BULL (trend opposé)` };
+        return { blocked: true, reason: `SELL bloqué — structure BULL` };
     }
 
     return { blocked: false };
 }
 
 // ============================================================
-// PROMPT SYSTEME POUR CLAUDE — V3.2 Fusion (SL=freshness, TP=score)
+// PROMPT SYSTEME V4.0 — Compatible OKI Fusion v2.0
 // ============================================================
 const SYSTEM_PROMPT = `Tu es Oki, un analyste trading SMC/ICT senior specialise sur le Gold (XAUUSD).
 
-TON ROLE : analyser chaque signal OKI Fusion v1.0 et donner un verdict GO ou NO GO.
+TON ROLE : analyser chaque signal OKI Fusion et donner un verdict GO ou NO GO.
 
-LE SIGNAL CONTIENT 7 CRITERES :
+LE SIGNAL PEUT CONTENIR JUSQU'A 10 CRITERES :
+=== BASE (7 points) ===
 1-5. SMC classiques : CHoCH/BOS, OB, FVG, Zone Premium/Discount, Kill Zone
 6. Bias directionnel (PDH/PDL, Weekly Open, DXY, Liquidity Sweep) — force 0 a 4
 7. OPR Sweep (NY Opening Range sweep detecte)
 
-REGLES ABSOLUES (aucune exception, aucun "malgre") :
-1. Le biais HTF DOIT etre aligne avec le signal. HTF oppose = NO GO. PAS DE "malgre". Conflit = NO GO.
-2. Le bias directionnel DOIT etre aligne ou neutre. Oppose = NO GO.
-3. La structure (trend) DOIT etre alignee. Trend oppose = NO GO.
-4. Zone Premium/Discount : BUY en discount UNIQUEMENT, SELL en premium UNIQUEMENT.
-5. Kill Zone active (London/New York) renforce. Hors KZ = prudence accrue.
-6. OPR Sweep actif = bonus fort en session NY.
-7. Bias fort (3+/4) + OPR Sweep = setup A+ (confiance maximale).
+=== V2.0 MODULES (3 points bonus) ===
+8. FVG Confluence — prix proche d'un FVG non rempli dans la direction du signal (+1)
+9. EQL Pool — sweep de liquidite sur Equal Highs/Lows detecte (+1)
+10. Delta Volume — pression directionnelle confirmee par le CVD approxime (+1)
 
-=== OB FRESHNESS — REGLE CLE (backteste sur 1 mois) ===
-L'OB Freshness est le facteur #1 de reussite du trade.
-- OB 100% (vierge, 0 retests) = zone tres reactive, haute probabilite TP.
-- OB 80-99% = zone encore forte, bonne probabilite.
-- OB 50-79% = zone affaiblie, probabilite moyenne.
-- OB < 50% = zone epuisee, faible probabilite → prudence maximale.
+Le maxscore est dynamique (7, 8, 9 ou 10 selon les modules actifs).
+
+REGLES ABSOLUES :
+1. HTF Bias DOIT etre aligne. Oppose = NO GO.
+2. Bias directionnel DOIT etre aligne ou neutre. Oppose = NO GO.
+3. Structure (trend) DOIT etre alignee. Oppose = NO GO.
+4. BUY en discount UNIQUEMENT, SELL en premium UNIQUEMENT.
+5. Kill Zone active = bonus. Hors KZ = prudence.
+6. OPR Sweep actif = bonus fort en session NY.
+7. FVG Confluence alignee = confluence supplementaire forte.
+8. EQL Sweep = liquidite prise, mouvement probable.
+9. Delta Volume aligne = confirmation de pression.
+
+=== OB FRESHNESS ===
+- OB 100% = zone vierge, haute probabilite.
+- OB 80-99% = zone forte.
+- OB 50-79% = zone affaiblie.
+- OB < 50% = zone epuisee, prudence.
+
+SL adaptatif selon OB Freshness :
+  OB 100% : SL = ATR x 1.2
+  OB 80-99% : SL = ATR x 1.5
+  OB 50-79% : SL = ATR x 1.8
+  OB < 50% : SL = ATR x 2.0
+
+TP adaptatif selon le SCORE (normalise sur le maxscore) :
+  Score < 60% : TP1 = 1.5R | TP2 = 2.1R
+  Score 60-70% : TP1 = 2.0R | TP2 = 3.1R
+  Score 70-85% : TP1 = 2.5R | TP2 = 4.1R
+  Score 85%+ : TP1 = 3.0R | TP2 = 5.1R
 
 INTERDIT :
-- Dire GO avec une reserve ("malgre", "cependant", "toutefois")
-- Si tu hesites entre GO et NO GO = NO GO
-- Recommander plus de 0.01 lot. TOUJOURS 0.01 lot.
+- GO avec reserve ("malgre", "cependant")
+- Si tu hesites = NO GO
+- Plus de 0.01 lot. TOUJOURS 0.01.
 
-FORMAT DE REPONSE (strict) :
+FORMAT (strict) :
 VERDICT: GO ou NO GO
 GRADE: A+, A, B, C ou D
 CONFIANCE: 1 a 5 etoiles
-RAISON: une phrase max, directe, sans reserve
-ENTREE: prix exact du signal
+RAISON: une phrase max
+ENTREE: prix exact
+SL: prix
+TP1: prix
+TP2: prix
+R:R: ratio
 
-=== CALCUL SL/TP ===
-
-SL adaptatif selon OB Freshness :
-  OB 100% : SL = ATR x 1.2 (tight, zone vierge)
-  OB 80-99% : SL = ATR x 1.5 (standard)
-  OB 50-79% : SL = ATR x 1.8 (large)
-  OB < 50% : SL = ATR x 2.0 (tres large)
-
-TP adaptatif selon le SCORE (R:R de 2.1 a 5.1) :
-  Score 4/7 : TP1 = 1.5R | TP2 = 2.1R
-  Score 5/7 : TP1 = 2.0R | TP2 = 3.1R
-  Score 6/7 : TP1 = 2.5R | TP2 = 4.1R
-  Score 7/7 : TP1 = 3.0R | TP2 = 5.1R
-
-Les niveaux SL/TP/RR sont PRE-CALCULES par l'indicateur et fournis dans le signal.
-Confirme-les ou ajuste legerement si necessaire.
-Affiche TOUJOURS les niveaux exacts.
-
-RISQUE: 0.01 lot (toujours)
-
-GRADING (large, Claude decide GO/NO GO selon le contexte) :
-- A+ : Score 7/7, bias fort (3+/4), OPR sweep, OB 80%+ — trade parfait, GO
-- A  : Score 6/7, bias aligne, KZ active, OB 80%+ — tres bon setup, GO
-- B  : Score 5/7, conditions correctes, OB 60%+ — bon setup, GO
-- C  : Score 4/7, OB fresh 80%+ ET (KZ active OU bias aligne) — acceptable, GO ou NO GO selon analyse.
-- D  : Score 4/7 sans OB 80% ou sans confluences — setup faible, NO GO
-
-BONUS :
-- OB 100% peut UPGRADER un grade d'un cran (C → B, B → A).
-- OB < 50% DOWNGRADE d'un cran (B → C, A → B).
+GRADING :
+- A+ : Score 85%+, bias fort, OPR, OB 80%+, modules v2.0 alignes
+- A  : Score 70-85%, bias aligne, KZ active, OB 80%+
+- B  : Score 60-70%, conditions correctes, OB 60%+
+- C  : Score ~60%, OB 80%+ ET (KZ ou bias aligne)
+- D  : Score bas ou confluences manquantes — NO GO
 
 Reponds UNIQUEMENT dans ce format.`;
 
@@ -180,15 +258,24 @@ Reponds UNIQUEMENT dans ce format.`;
 // ============================================================
 function callClaude(signalData) {
     const maxscore = signalData.maxscore || '7';
+    const scorePct = Math.round((parseInt(signalData.score) / parseInt(maxscore)) * 100);
 
-    const userMessage = `Signal OKI Fusion v1.0 recu :
+    let v2Info = '';
+    if (parseInt(maxscore) > 7) {
+        v2Info = `\n--- MODULES V2.0 ---
+- FVG Confluence : ${signalData.fvg_conf || 'N/A'}
+- EQL Sweep : ${signalData.eql_sweep || 'non'}
+- Delta Volume : ${signalData.delta || 'N/A'}`;
+    }
+
+    const userMessage = `Signal OKI Fusion recu :
 - Direction : ${signalData.signal || signalData.dir || '?'}
 - Paire : ${signalData.pair || '?'}
 - Timeframe : ${signalData.tf || '?'}
 - Prix actuel : ${signalData.price || signalData.entry || '?'}
 - Biais HTF : ${signalData.bias || '?'}
 - Zone : ${signalData.zone || '?'}
-- Score : ${signalData.score || '?'}/${maxscore}
+- Score : ${signalData.score || '?'}/${maxscore} (${scorePct}%)
 - Structure (Trend) : ${signalData.struct || '?'}
 - Kill Zone : ${signalData.kz || '?'}
 - RSI : ${signalData.rsi || '?'}
@@ -200,14 +287,13 @@ function callClaude(signalData) {
 - Bias force : ${signalData.bias_str || '?'}/4
 - OPR Sweep : ${signalData.opr_sweep && signalData.opr_sweep !== 'NONE' && signalData.opr_sweep !== 'non' ? signalData.opr_sweep : 'non'}
 - ATR(14) : ${signalData.atr || '?'}
-
+${v2Info}
 - SL pre-calcule : ${signalData.sl || '?'}
 - TP1 pre-calcule : ${signalData.tp1 || '?'}
 - TP2 pre-calcule : ${signalData.tp2 || '?'}
 - R:R max : ${signalData.rr || '?'}
 
-Analyse ce signal. SL/TP/RR sont pre-calcules (SL selon OB freshness, TP selon score).
-Confirme ou ajuste si necessaire. Donne ton verdict.`;
+Analyse ce signal. Donne ton verdict.`;
 
     const payload = JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
@@ -265,10 +351,8 @@ Confirme ou ajuste si necessaire. Donne ton verdict.`;
 }
 
 // ============================================================
-// FORMATER LES MESSAGES TELEGRAM
+// FORMATER MESSAGES TELEGRAM
 // ============================================================
-
-// Signal avec verdict Claude
 function formatVerdict(analysis, data) {
     const dir = data.signal || data.dir || '?';
     const pair = data.pair || '?';
@@ -276,20 +360,18 @@ function formatVerdict(analysis, data) {
     const maxscore = data.maxscore || '7';
     const score = data.score || '?';
     const biasStr = data.bias_str || '?';
-    const oprSweep = data.opr_sweep && data.opr_sweep !== 'NONE' && data.opr_sweep !== 'non' && data.opr_sweep !== 'false';
 
     const isGO = analysis.includes('VERDICT: GO') && !analysis.includes('NO GO');
     const verdictEmoji = isGO ? '✅' : '❌';
     const verdictText = isGO ? 'GO' : 'NO GO';
 
-    // Detect grade
     let grade = '';
     const gradeMatch = analysis.match(/GRADE:\s*(A\+|A|B|C|D)/i);
     if (gradeMatch) grade = ` [${gradeMatch[1]}]`;
 
-    const oprBadge = oprSweep ? ' \u{1F534}OPR' : '';
+    const oprSweep = data.opr_sweep && data.opr_sweep !== 'NONE' && data.opr_sweep !== 'non' && data.opr_sweep !== 'false';
+    const oprBadge = oprSweep ? ' 🔴OPR' : '';
 
-    // OB Freshness badge
     const obFresh = parseInt(data.ob_fresh) || 0;
     let freshBadge = '';
     if (obFresh >= 100) freshBadge = ' 💎OB100%';
@@ -297,18 +379,27 @@ function formatVerdict(analysis, data) {
     else if (obFresh >= 50) freshBadge = ' 🟡OB' + obFresh + '%';
     else if (obFresh > 0) freshBadge = ' 🔴OB' + obFresh + '%';
 
-    // R:R badge
     const rr = data.rr || '';
     const rrBadge = rr ? ` | ${rr}R` : '';
 
-    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}${rrBadge}
+    // V2.0 badges
+    let v2Badges = '';
+    if (parseInt(maxscore) > 7) {
+        const fvg = (data.fvg_conf || '').toUpperCase();
+        const eql = (data.eql_sweep || '').toLowerCase();
+        const delta = (data.delta || '').toUpperCase();
+        if (fvg === 'BULL' || fvg === 'BEAR') v2Badges += ' 📐FVG';
+        if (eql !== 'non' && eql !== '' && eql !== '?') v2Badges += ' 💰EQL';
+        if (delta.includes('BULL') || delta.includes('BEAR')) v2Badges += ' 📊ΔV';
+    }
+
+    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}${v2Badges}${rrBadge}
 
 ${analysis}
 
 _Signal: ${dir} ${pair} ${tf} | Score ${score}/${maxscore} | Bias ${biasStr}/4_`;
 }
 
-// Signal bloqué par filtre dur
 function formatBlocked(reason, data) {
     const dir = data.signal || data.dir || '?';
     const pair = data.pair || '?';
@@ -316,18 +407,17 @@ function formatBlocked(reason, data) {
     const score = data.score || '?';
     const maxscore = data.maxscore || '7';
 
-    return `\u{1F6AB} *SIGNAL BLOQUÉ*
+    return `🚫 *SIGNAL BLOQUÉ*
 
 ${reason}
 
 _Signal: ${dir} ${pair} ${tf} — Score ${score}/${maxscore}_
-_Filtre V3.2 actif — signal rejeté avant analyse Claude_`;
+_Filtre V4.0 actif — signal rejeté avant analyse Claude_`;
 }
 
-// Signal sans Claude (fallback)
 function formatFallback(data) {
     const dir = data.signal || data.dir || '?';
-    const emoji = dir === 'BUY' ? '\u{1F7E2}' : '\u{1F534}';
+    const emoji = dir === 'BUY' ? '🟢' : '🔴';
     const pair = data.pair || '?';
     const tf = data.tf || '?';
     const price = data.price || data.entry || '?';
@@ -335,60 +425,49 @@ function formatFallback(data) {
     const zone = data.zone || '?';
     const score = data.score || '?';
     const maxscore = data.maxscore || '7';
-    const biasDir = data.bias_dir || '?';
-    const biasStr = data.bias_str || '?';
-    const oprSweep = data.opr_sweep && data.opr_sweep !== 'NONE' && data.opr_sweep !== 'non' && data.opr_sweep !== 'false';
 
-    let msg = `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/${maxscore}
+    return `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/${maxscore}
 
 Prix: \`${price}\`
 Biais HTF: ${bias}
 Zone: ${zone}
-Bias: ${biasDir} (${biasStr}/4)`;
 
-    if (oprSweep) {
-        msg += `\n\u{1F534} OPR Sweep actif`;
-    }
-
-    msg += `\n\n⚠️ _Analyse Claude indisponible — signal brut_`;
-    return msg;
+⚠️ _Analyse Claude indisponible — signal brut_`;
 }
 
-// Surveillance : HTF Flip
 function formatHTFFlip(data) {
     const pair = data.pair || '?';
     const newDir = data.new_dir || data.direction || data.bias || '?';
     const price = data.price || '?';
     const tf = data.tf || '?';
 
-    return `\u{1F504} *SURVEILLANCE — HTF FLIP*
+    return `🔄 *SURVEILLANCE — HTF FLIP*
 
 Paire: *${pair}* (${tf})
 Nouveau biais: *${newDir}*
 Prix: \`${price}\`
 
-_Changement de direction HTF détecté — vérifier les setups_`;
+_Changement de direction HTF détecté_`;
 }
 
-// Surveillance : Bias Fort
 function formatBiasFort(data) {
     const pair = data.pair || '?';
     const biasDir = data.bias_dir || data.direction || '?';
     const biasStr = data.bias_str || data.strength || '?';
     const price = data.price || '?';
 
-    return `\u{1F525} *SURVEILLANCE — BIAS FORT*
+    return `🔥 *SURVEILLANCE — BIAS FORT*
 
 Paire: *${pair}*
 Direction: *${biasDir}*
-Force: *${biasStr}/4* confluences
+Force: *${biasStr}/4*
 Prix: \`${price}\`
 
 _Bias fort détecté — chercher entrée alignée_`;
 }
 
 // ============================================================
-// ENVOYER SUR TELEGRAM
+// ENVOYER TELEGRAM
 // ============================================================
 function sendTelegram(text) {
     const payload = JSON.stringify({
@@ -428,25 +507,237 @@ function sendTelegram(text) {
 }
 
 // ============================================================
+// CALCUL STATS
+// ============================================================
+function computeStats(entries) {
+    const total = entries.length;
+    const signals = entries.filter(e => !e.blocked);
+    const blocked = entries.filter(e => e.blocked);
+    const go = signals.filter(e => e.verdict.includes('GO') && !e.verdict.includes('NO GO'));
+    const noGo = signals.filter(e => e.verdict.includes('NO GO'));
+
+    const wins = entries.filter(e => e.result === 'WIN');
+    const losses = entries.filter(e => e.result === 'LOSS');
+    const be = entries.filter(e => e.result === 'BE');
+    const pending = entries.filter(e => e.result === 'PENDING');
+
+    const winRate = (wins.length + losses.length) > 0
+        ? Math.round(wins.length / (wins.length + losses.length) * 100) : 0;
+
+    const totalPnl = entries.reduce((sum, e) => sum + (e.pnl || 0), 0);
+
+    // Stats par session (KZ)
+    const byKZ = {};
+    entries.forEach(e => {
+        const kz = e.kz || 'UNKNOWN';
+        if (!byKZ[kz]) byKZ[kz] = { total: 0, wins: 0, losses: 0 };
+        byKZ[kz].total++;
+        if (e.result === 'WIN') byKZ[kz].wins++;
+        if (e.result === 'LOSS') byKZ[kz].losses++;
+    });
+
+    // Stats par direction
+    const byDir = {};
+    entries.forEach(e => {
+        const dir = e.direction || '?';
+        if (!byDir[dir]) byDir[dir] = { total: 0, wins: 0, losses: 0 };
+        byDir[dir].total++;
+        if (e.result === 'WIN') byDir[dir].wins++;
+        if (e.result === 'LOSS') byDir[dir].losses++;
+    });
+
+    // Stats par jour de semaine
+    const byDay = {};
+    entries.forEach(e => {
+        const d = new Date(e.timestamp);
+        const day = ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'][d.getDay()];
+        if (!byDay[day]) byDay[day] = { total: 0, wins: 0, losses: 0 };
+        byDay[day].total++;
+        if (e.result === 'WIN') byDay[day].wins++;
+        if (e.result === 'LOSS') byDay[day].losses++;
+    });
+
+    // Score moyen winners vs losers
+    const avgScoreWin = wins.length > 0
+        ? Math.round(wins.reduce((s, e) => s + (e.score / e.maxscore * 100), 0) / wins.length) : 0;
+    const avgScoreLoss = losses.length > 0
+        ? Math.round(losses.reduce((s, e) => s + (e.score / e.maxscore * 100), 0) / losses.length) : 0;
+
+    return {
+        total,
+        blocked: blocked.length,
+        signals: signals.length,
+        go: go.length,
+        noGo: noGo.length,
+        wins: wins.length,
+        losses: losses.length,
+        be: be.length,
+        pending: pending.length,
+        winRate,
+        totalPnl: Math.round(totalPnl * 100) / 100,
+        avgScoreWin,
+        avgScoreLoss,
+        byKZ,
+        byDir,
+        byDay
+    };
+}
+
+// ============================================================
 // SERVEUR HTTP
 // ============================================================
 const server = http.createServer(async (req, res) => {
-    // Health check
+
+    // ── Health check ──
     if (req.method === 'GET' && req.url === '/') {
+        const journal = readJournal();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            status: 'Oki Alerts V3.2 actif — Fusion compatible',
-            version: '3.2',
-            scoring: '7/7 (Fusion) — min 4/7, grading A+ A B C D, SL=freshness TP=score 2.1-5.1R',
-            filtres: 'HTF/Bias/BiasDir/Struct/Zone/Score(4+) + XAUUSD only',
-            surveillance: 'HTF Flip + Bias Fort',
-            claude: ANTHROPIC_API_KEY ? 'configure' : 'PAS CONFIGURE',
-            telegram: TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'configure' : 'PAS CONFIGURE'
+            status: 'Oki Alerts V4.0 actif — Fusion v2.0 + Trade Journal',
+            version: '4.0',
+            scoring: 'Dynamique /7 /8 /9 /10 — min 60%',
+            modules_v2: 'FVG Confluence, EQL Pool, Delta Volume',
+            journal_entries: journal.length,
+            claude: ANTHROPIC_API_KEY ? 'configuré' : 'PAS CONFIGURE',
+            telegram: TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'configuré' : 'PAS CONFIGURE'
         }));
         return;
     }
 
-    // Webhook TradingView
+    // ── JOURNAL — Consulter l'historique ──
+    if (req.method === 'GET' && req.url.startsWith('/journal')) {
+        const url = new URL(req.url, `http://localhost:${PORT}`);
+        const last = parseInt(url.searchParams.get('last')) || 20;
+        const dir = (url.searchParams.get('dir') || '').toUpperCase();
+        const result = (url.searchParams.get('result') || '').toUpperCase();
+
+        let entries = readJournal();
+
+        // Filtres optionnels
+        if (dir) entries = entries.filter(e => e.direction === dir);
+        if (result) entries = entries.filter(e => e.result === result);
+
+        // Derniers N
+        entries = entries.slice(-last);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: true,
+            total: readJournal().length,
+            showing: entries.length,
+            filters: { last, dir: dir || 'all', result: result || 'all' },
+            entries
+        }, null, 2));
+        return;
+    }
+
+    // ── STATS — Win rate, sessions, etc. ──
+    if (req.method === 'GET' && req.url.startsWith('/stats')) {
+        const url = new URL(req.url, `http://localhost:${PORT}`);
+        const days = parseInt(url.searchParams.get('days')) || 0; // 0 = tout
+
+        let entries = readJournal();
+
+        if (days > 0) {
+            const cutoff = new Date();
+            cutoff.setDate(cutoff.getDate() - days);
+            entries = entries.filter(e => new Date(e.timestamp) >= cutoff);
+        }
+
+        const stats = computeStats(entries);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: true,
+            period: days > 0 ? `${days} derniers jours` : 'tout',
+            stats
+        }, null, 2));
+        return;
+    }
+
+    // ── RESULT — Enregistrer le résultat d'un trade ──
+    if (req.method === 'POST' && req.url === '/result') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { id, result, pnl, notes } = JSON.parse(body);
+                if (!id || !result) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'id et result requis (WIN/LOSS/BE)' }));
+                    return;
+                }
+
+                const entries = readJournal();
+                const entry = entries.find(e => e.id === id);
+                if (!entry) {
+                    res.writeHead(404, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: `Trade #${id} non trouvé` }));
+                    return;
+                }
+
+                entry.result = result.toUpperCase();
+                if (pnl !== undefined) entry.pnl = parseFloat(pnl) || 0;
+                if (notes) entry.notes = notes;
+
+                writeJournal(entries);
+                console.log(`[JOURNAL] Trade #${id} → ${entry.result} (${entry.pnl}€)`);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, updated: entry }));
+            } catch (err) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: err.message }));
+            }
+        });
+        return;
+    }
+
+    // ── RAPPORT TELEGRAM — Envoie les stats sur Telegram ──
+    if (req.method === 'GET' && req.url.startsWith('/report')) {
+        const url = new URL(req.url, `http://localhost:${PORT}`);
+        const days = parseInt(url.searchParams.get('days')) || 7;
+
+        let entries = readJournal();
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - days);
+        entries = entries.filter(e => new Date(e.timestamp) >= cutoff);
+
+        const stats = computeStats(entries);
+
+        const msg = `📊 *OKI RAPPORT — ${days} derniers jours*
+
+Signaux totaux: *${stats.total}*
+├ Bloqués par filtre: ${stats.blocked}
+├ Analysés: ${stats.signals}
+├ GO: ${stats.go} | NO GO: ${stats.noGo}
+
+*Résultats:*
+├ ✅ Wins: ${stats.wins}
+├ ❌ Losses: ${stats.losses}
+├ ➖ BE: ${stats.be}
+├ ⏳ Pending: ${stats.pending}
+├ 📈 Win Rate: *${stats.winRate}%*
+├ 💰 P&L: *${stats.totalPnl}€*
+
+*Score moyen:*
+├ Winners: ${stats.avgScoreWin}%
+├ Losers: ${stats.avgScoreLoss}%
+
+_Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
+
+        try {
+            await sendTelegram(msg);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, report: 'sent', days, stats }));
+        } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+    }
+
+    // ── Webhook TradingView ──
     if (req.method === 'POST' && req.url === '/webhook') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -461,64 +752,62 @@ const server = http.createServer(async (req, res) => {
 
                 console.log(`[${new Date().toISOString()}] Type: ${alertType} | ${dir} ${pair} Score ${score}/${maxscore}`);
 
-                // ── ALERTES SURVEILLANCE (pas de filtre, pas de Claude, envoi direct) ──
+                // ── Surveillance ──
                 if (alertType === 'htf_flip') {
-                    const msg = formatHTFFlip(data);
-                    await sendTelegram(msg);
-                    console.log('Surveillance HTF Flip envoyee');
+                    await sendTelegram(formatHTFFlip(data));
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: true, type: 'htf_flip' }));
                     return;
                 }
-
                 if (alertType === 'bias_fort') {
-                    const msg = formatBiasFort(data);
-                    await sendTelegram(msg);
-                    console.log('Surveillance Bias Fort envoyee');
+                    await sendTelegram(formatBiasFort(data));
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: true, type: 'bias_fort' }));
                     return;
                 }
 
-                // ── FILTRE DUR V3.2 ──
+                // ── Filtre dur V4.0 ──
                 const filter = hardFilter(data);
                 if (filter.blocked) {
                     console.log(`[BLOQUÉ] ${filter.reason}`);
 
-                    if (filter.reason.includes('ignorée')) {
-                        console.log('Paire ignorée — pas de notification Telegram');
-                    } else {
+                    // Log dans journal même si bloqué
+                    logTrade(data, 'BLOCKED', true, filter.reason);
+
+                    if (!filter.reason.includes('ignorée')) {
                         await sendTelegram(formatBlocked(filter.reason, data));
                     }
 
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, version: 'v3.2', blocked: true, reason: filter.reason }));
+                    res.end(JSON.stringify({ ok: true, version: 'v4.0', blocked: true, reason: filter.reason }));
                     return;
                 }
 
-                // ── ANALYSE CLAUDE (signal a passé le filtre dur) ──
+                // ── Analyse Claude ──
+                let verdict = 'FALLBACK';
                 if (ANTHROPIC_API_KEY) {
-                    console.log(`Signal validé par filtre dur (${score}/${maxscore}) — analyse Claude en cours...`);
+                    console.log(`Signal validé (${score}/${maxscore}) — analyse Claude...`);
                     const analysis = await callClaude(data);
 
                     if (analysis) {
-                        const verdictMsg = formatVerdict(analysis, data);
-                        await sendTelegram(verdictMsg);
                         const isGO = analysis.includes('VERDICT: GO') && !analysis.includes('NO GO');
-                        console.log('Verdict envoyé:', isGO ? 'GO' : 'NO GO');
+                        verdict = isGO ? 'GO' : 'NO GO';
+                        await sendTelegram(formatVerdict(analysis, data));
+                        console.log('Verdict:', verdict);
                     } else {
-                        const fallbackMsg = formatFallback(data);
-                        await sendTelegram(fallbackMsg);
-                        console.log('Fallback envoyé (Claude indisponible)');
+                        await sendTelegram(formatFallback(data));
+                        console.log('Fallback (Claude indisponible)');
                     }
                 } else {
-                    const rawMsg = formatFallback(data);
-                    await sendTelegram(rawMsg);
+                    await sendTelegram(formatFallback(data));
                     console.log('Mode brut (pas de clé Claude)');
                 }
 
+                // Log dans journal
+                logTrade(data, verdict, false, '');
+
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: true, version: 'v3.2' }));
+                res.end(JSON.stringify({ ok: true, version: 'v4.0', verdict }));
             } catch (err) {
                 console.error('Erreur:', err.message);
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -528,39 +817,21 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Test signal Fusion
+    // ── Test signal ──
     if (req.method === 'GET' && req.url === '/test') {
         const testData = {
-            signal: 'BUY',
-            pair: 'XAUUSD',
-            tf: '15',
-            price: '2650.50',
-            bias: 'BULLISH',
-            zone: 'DISCOUNT',
-            score: '6',
-            maxscore: '7',
-            struct: 'BULL',
-            kz: 'NEW_YORK',
-            rsi: '42',
-            ob_actifs: '3',
-            ob_testes: '1',
-            ob_fresh: '85',
-            ob_retests: '0',
-            bias_dir: 'BULL',
-            bias_str: '3',
-            opr_sweep: 'LOW',
-            atr: '12.50',
-            sl: '2635.50',
-            tp1: '2688.00',
-            tp2: '2706.50',
-            rr: '4.1'
+            signal: 'BUY', pair: 'XAUUSD', tf: '15', price: '2650.50',
+            bias: 'BULLISH', zone: 'DISCOUNT', score: '8', maxscore: '10',
+            struct: 'BULL', kz: 'NEW_YORK', rsi: '42',
+            ob_actifs: '3', ob_testes: '1', ob_fresh: '85', ob_retests: '0',
+            bias_dir: 'BULL', bias_str: '3', opr_sweep: 'LOW', atr: '12.50',
+            fvg_conf: 'BULL', eql_sweep: 'HIGH', delta: 'BULL 15.2K',
+            sl: '2635.50', tp1: '2688.00', tp2: '2706.50', rr: '4.1'
         };
 
-        console.log('[TEST] Simulation signal Fusion BUY XAUUSD 6/7...');
-
+        console.log('[TEST] Simulation signal Fusion v2.0 BUY XAUUSD 8/10...');
         const filter = hardFilter(testData);
         if (filter.blocked) {
-            console.log(`[TEST BLOQUÉ] ${filter.reason}`);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, test: true, blocked: true, reason: filter.reason }));
             return;
@@ -570,12 +841,14 @@ const server = http.createServer(async (req, res) => {
             if (ANTHROPIC_API_KEY) {
                 const analysis = await callClaude(testData);
                 if (analysis) {
+                    logTrade(testData, analysis.includes('NO GO') ? 'NO GO' : 'GO', false, '');
                     await sendTelegram(formatVerdict(analysis, testData));
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: true, test: true, analysis }));
                     return;
                 }
             }
+            logTrade(testData, 'FALLBACK', false, '');
             await sendTelegram(formatFallback(testData));
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, test: true, fallback: true }));
@@ -586,11 +859,9 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Test surveillance
+    // ── Test surveillance ──
     if (req.method === 'GET' && req.url === '/test-surv') {
-        console.log('[TEST] Simulation alertes surveillance...');
         try {
-            // Test format Fusion (direction au lieu de new_dir/bias_dir)
             await sendTelegram(formatHTFFlip({
                 signal: 'SURVEILLANCE', type: 'HTF_FLIP',
                 pair: 'XAUUSD', direction: 'BEAR', price: '2600.00', tf: 'H1'
@@ -608,7 +879,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Test filtre seul
+    // ── Test filtre seul ──
     if (req.method === 'POST' && req.url === '/test-filter') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -616,9 +887,8 @@ const server = http.createServer(async (req, res) => {
             try {
                 const data = JSON.parse(body);
                 const filter = hardFilter(data);
-                console.log(`[TEST-FILTER] ${filter.blocked ? 'BLOQUÉ: ' + filter.reason : 'PASSÉ'}`);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: true, ...filter, data_received: data }));
+                res.end(JSON.stringify({ ok: true, ...filter }));
             } catch (err) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -632,27 +902,23 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
+    const journal = readJournal();
     console.log('========================================');
-    console.log('  OKI ALERTS V3.2 — Fusion Compatible (TP/SL adaptatif)');
+    console.log('  OKI ALERTS V4.0 — Fusion v2.0 + Trade Journal');
     console.log('========================================');
     console.log(`Port: ${PORT}`);
-    console.log(`Scoring: 7/7 (Fusion) — min 4/7, grading A+/A/B/C/D`);
+    console.log(`Scoring: Dynamique /7 /8 /9 /10 — min 60%`);
     console.log(`Claude API: ${ANTHROPIC_API_KEY ? 'OK' : 'PAS CONFIGURE'}`);
     console.log(`Telegram: ${TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'OK' : 'PAS CONFIGURE'}`);
-    console.log(`Paires: ${ALLOWED_PAIRS.join(', ')}`);
-    console.log('Filtres:');
-    console.log('  - Paire autorisée uniquement');
-    console.log('  - Score minimum 4/7 (Fusion) ou 3/5 (legacy)');
-    console.log('  - HTF Bias + Bias Dir alignés');
-    console.log('  - Structure/Trend alignée');
-    console.log('  - Zone Premium/Discount correcte');
-    console.log('Surveillance:');
-    console.log('  - HTF Flip (changement direction)');
-    console.log('  - Bias Fort (3+/4 confluences)');
+    console.log(`Journal: ${journal.length} trades enregistrés`);
     console.log('Endpoints:');
     console.log('  GET  /           -> Health check');
     console.log('  POST /webhook    -> Signal TradingView');
-    console.log('  GET  /test       -> Test signal Fusion');
+    console.log('  GET  /journal    -> Historique (?last=20&dir=BUY&result=WIN)');
+    console.log('  GET  /stats      -> Statistiques (?days=7)');
+    console.log('  POST /result     -> Résultat trade {id, result, pnl, notes}');
+    console.log('  GET  /report     -> Rapport Telegram (?days=7)');
+    console.log('  GET  /test       -> Test signal v2.0');
     console.log('  GET  /test-surv  -> Test surveillance');
     console.log('  POST /test-filter -> Test filtre seul');
     console.log('========================================');
