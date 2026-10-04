@@ -392,6 +392,20 @@ Analyse ce signal. Donne ton verdict.`;
 }
 
 // ============================================================
+// ESCAPE MARKDOWN TELEGRAM
+// ============================================================
+function escapeMarkdown(text) {
+    if (!text) return '';
+    // Échapper les caractères spéciaux Markdown de Telegram
+    // On garde * et _ pour nos propres formatages, on échappe dans le texte Claude
+    return text
+        .replace(/\[/g, '(')
+        .replace(/\]/g, ')')
+        .replace(/`/g, "'")
+        .replace(/~/g, '-');
+}
+
+// ============================================================
 // FORMATER MESSAGES TELEGRAM
 // ============================================================
 function formatVerdict(analysis, data) {
@@ -450,9 +464,11 @@ function formatVerdict(analysis, data) {
     // Core scoring info
     const coreInfo = data.core ? ` | core:${core} min:${minscore}` : '';
 
+    const safeAnalysis = escapeMarkdown(analysis);
+
     return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}${v2Badges}${penaltyBadges}${dirBadge}${rrBadge}
 
-${analysis}
+${safeAnalysis}
 
 _Signal: ${dir} ${pair} ${tf} | Score ${score}/${maxscore}${coreInfo} | Bias ${biasStr}/4_`;
 }
