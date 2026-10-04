@@ -1,7 +1,9 @@
 // ============================================================
-// OKI ALERTS V4.0 — TradingView → Filtre + Claude AI → Telegram + Journal
-// V4.0 : Trade Journal auto + Compatibilité OKI Fusion v2.0 (scoring /10)
-// Nouveaux champs : fvg_conf, eql_sweep, delta, maxscore dynamique
+// OKI ALERTS V4.1 — TradingView → Filtre + Claude AI → Telegram + Journal
+// V4.1 : CORE+BONUS scoring (OKI Fusion v2.0)
+// Core = HTF, CHoCH/BOS, Premium/Discount, OB+FVG, KZ, Bias, OPR
+// Bonus = FVG Conf, EQL, Delta Vol (ajoutent au score, pas au seuil)
+// Nouveaux champs : core, minscore, rsi_penalty, htf_zone_penalty, dir_mode
 // Endpoints : /journal (historique), /stats (win rate, sessions)
 // Deploy sur Render.com (free tier)
 // ============================================================
@@ -58,6 +60,8 @@ function logTrade(data, verdict, blocked, blockReason) {
         price: parseFloat(data.price || data.entry) || 0,
         score: parseInt(data.score) || 0,
         maxscore: parseInt(data.maxscore) || 7,
+        core: parseInt(data.core) || parseInt(data.maxscore) || 7,
+        minscore: parseInt(data.minscore) || 0,
         bias_htf: data.bias || '?',
         trend: data.struct || '?',
         zone: data.zone || '?',
@@ -71,6 +75,10 @@ function logTrade(data, verdict, blocked, blockReason) {
         fvg_conf: data.fvg_conf || '?',
         eql_sweep: data.eql_sweep || 'non',
         delta: data.delta || '?',
+        // V2.0 protection layers
+        rsi_penalty: data.rsi_penalty || 'non',
+        htf_zone_penalty: data.htf_zone_penalty || 'non',
+        dir_mode: data.dir_mode || '?',
         // Levels
         sl: data.sl || '?',
         tp1: data.tp1 || '?',
@@ -87,7 +95,7 @@ function logTrade(data, verdict, blocked, blockReason) {
     };
     entries.push(entry);
     writeJournal(entries);
-    console.log(`[JOURNAL] Trade #${entry.id} logged: ${entry.direction} ${entry.pair} ${entry.score}/${entry.maxscore} — ${entry.verdict}`);
+    console.log(`[JOURNAL] Trade #${entry.id} logged: ${entry.direction} ${entry.pair} ${entry.score}/${entry.maxscore} (core:${entry.core} min:${entry.minscore}) — ${entry.verdict}`);
     return entry;
 }
 
@@ -110,7 +118,9 @@ function getAlertType(data) {
 }
 
 // ============================================================
-// FILTRE DUR V4.0 — Compatible v1.x (maxscore 7) et v2.0 (maxscore 10)
+// FILTRE DUR V4.1 — CORE+BONUS scoring
+// v2.0 envoie "core" = max CORE (sans bonus). Seuil = 50% du core.
+// v1.x pas de champ "core" → fallback ancien calcul.
 // ============================================================
 function hardFilter(data) {
     const signal = (data.signal || data.dir || '').toUpperCase();
@@ -128,18 +138,23 @@ function hardFilter(data) {
         return { blocked: true, reason: `Paire ${pair} ignorée — XAUUSD uniquement` };
     }
 
-    // 2. Score minimum dynamique
-    //    v1.x (max 5): min 3 | v1.1 (max 7): min 4 | v2.0 (max 8-10): min 60%
+    // 2. Score minimum — CORE+BONUS aware
+    //    v2.0 : data.core = max CORE, data.minscore = seuil calculé par Pine
+    //    v1.x : pas de core → fallback ancien calcul
     let minScore;
-    if (maxscore <= 5) {
+    if (data.core) {
+        // v2.0 CORE+BONUS : utiliser le minscore du Pine (50% du core)
+        minScore = parseInt(data.minscore) || Math.ceil(parseInt(data.core) * 0.5);
+    } else if (maxscore <= 5) {
         minScore = 3;
     } else if (maxscore <= 7) {
         minScore = 4;
     } else {
-        minScore = Math.ceil(maxscore * 0.6); // 60% du max — 6/10, 5/8, etc.
+        minScore = Math.ceil(maxscore * 0.5);
     }
     if (score < minScore) {
-        return { blocked: true, reason: `Score ${score}/${maxscore} insuffisant (minimum ${minScore}/${maxscore})` };
+        const coreInfo = data.core ? ` (core:${data.core})` : '';
+        return { blocked: true, reason: `Score ${score}/${maxscore}${coreInfo} insuffisant (minimum ${minScore})` };
     }
 
     // 3. HTF Bias opposé = NO GO
@@ -180,24 +195,38 @@ function hardFilter(data) {
 }
 
 // ============================================================
-// PROMPT SYSTEME V4.0 — Compatible OKI Fusion v2.0
+// PROMPT SYSTEME V4.1 — CORE+BONUS scoring
 // ============================================================
 const SYSTEM_PROMPT = `Tu es Oki, un analyste trading SMC/ICT senior specialise sur le Gold (XAUUSD).
 
 TON ROLE : analyser chaque signal OKI Fusion et donner un verdict GO ou NO GO.
 
-LE SIGNAL PEUT CONTENIR JUSQU'A 10 CRITERES :
-=== BASE (7 points) ===
-1-5. SMC classiques : CHoCH/BOS, OB, FVG, Zone Premium/Discount, Kill Zone
-6. Bias directionnel (PDH/PDL, Weekly Open, DXY, Liquidity Sweep) — force 0 a 4
-7. OPR Sweep (NY Opening Range sweep detecte)
+=== ARCHITECTURE CORE+BONUS (v2.0) ===
+Le score est sur un MAXIMUM DISPLAY (maxscore) mais le SEUIL ne porte que sur les criteres CORE.
 
-=== V2.0 MODULES (3 points bonus) ===
-8. FVG Confluence — prix proche d'un FVG non rempli dans la direction du signal (+1)
-9. EQL Pool — sweep de liquidite sur Equal Highs/Lows detecte (+1)
-10. Delta Volume — pression directionnelle confirmee par le CVD approxime (+1)
+CRITERES CORE (comptent dans le seuil) :
+1. HTF Trend — tendance Higher Timeframe
+2. CHoCH/BOS — cassure de structure
+3. Premium/Discount — zone correcte
+4. OB + FVG — Order Block avec Fair Value Gap
+5. Kill Zone — session active (ou crypto = toujours ON)
+6. Bias directionnel — PDH/PDL, Weekly Open, DXY, Liquidity Sweep (force 0-4)
+7. OPR Sweep — NY Opening Range sweep
 
-Le maxscore est dynamique (7, 8, 9 ou 10 selon les modules actifs).
+CRITERES BONUS (ajoutent au score mais PAS au seuil — ne peuvent que AIDER) :
+8. FVG Confluence — prix proche d'un FVG non rempli aligne (+1)
+9. EQL Pool — sweep de liquidite sur Equal Highs/Lows (+1)
+10. Delta Volume — pression directionnelle confirmee par CVD (+1)
+
+Le champ "core" = nombre de criteres CORE actifs.
+Le champ "minscore" = seuil minimum (50% du core).
+Le champ "maxscore" = affichage total (core + bonus modules actifs).
+Un score qui depasse le core grace aux bonus = signal renforce.
+
+=== PROTECTIONS v2.0 ===
+- RSI Penalty : -1pt si RSI > 70 (BUY) ou < 30 (SELL) = exhaustion
+- HTF/Zone Conflict : -2pts si HTF bearish+discount (BUY) ou HTF bullish+premium (SELL)
+- Dir Mode AUTO : filtre directionnel base sur HTF trend
 
 REGLES ABSOLUES :
 1. HTF Bias DOIT etre aligne. Oppose = NO GO.
@@ -209,6 +238,7 @@ REGLES ABSOLUES :
 7. FVG Confluence alignee = confluence supplementaire forte.
 8. EQL Sweep = liquidite prise, mouvement probable.
 9. Delta Volume aligne = confirmation de pression.
+10. RSI Penalty presente = prudence accrue, exhaustion possible.
 
 === OB FRESHNESS ===
 - OB 100% = zone vierge, haute probabilite.
@@ -222,7 +252,7 @@ SL adaptatif selon OB Freshness :
   OB 50-79% : SL = ATR x 1.8
   OB < 50% : SL = ATR x 2.0
 
-TP adaptatif selon le SCORE (normalise sur le maxscore) :
+TP adaptatif selon le SCORE (normalise sur le maxscore display) :
   Score < 60% : TP1 = 1.5R | TP2 = 2.1R
   Score 60-70% : TP1 = 2.0R | TP2 = 3.1R
   Score 70-85% : TP1 = 2.5R | TP2 = 4.1R
@@ -244,12 +274,12 @@ TP1: prix
 TP2: prix
 R:R: ratio
 
-GRADING :
-- A+ : Score 85%+, bias fort, OPR, OB 80%+, modules v2.0 alignes
-- A  : Score 70-85%, bias aligne, KZ active, OB 80%+
-- B  : Score 60-70%, conditions correctes, OB 60%+
-- C  : Score ~60%, OB 80%+ ET (KZ ou bias aligne)
-- D  : Score bas ou confluences manquantes — NO GO
+GRADING (basé sur score/core, pas score/maxscore) :
+- A+ : Score >= core, tous bonus alignes, bias fort, OPR, OB 80%+, aucune penalty
+- A  : Score >= core - 1, bias aligne, KZ active, OB 80%+
+- B  : Score >= minscore + 1, conditions correctes, OB 60%+
+- C  : Score = minscore, OB 80%+ ET (KZ ou bias aligne)
+- D  : Score < minscore ou confluences manquantes — NO GO
 
 Reponds UNIQUEMENT dans ce format.`;
 
@@ -258,14 +288,25 @@ Reponds UNIQUEMENT dans ce format.`;
 // ============================================================
 function callClaude(signalData) {
     const maxscore = signalData.maxscore || '7';
+    const core = signalData.core || maxscore;
+    const minscore = signalData.minscore || '?';
     const scorePct = Math.round((parseInt(signalData.score) / parseInt(maxscore)) * 100);
+    const corePct = Math.round((parseInt(signalData.score) / parseInt(core)) * 100);
 
     let v2Info = '';
-    if (parseInt(maxscore) > 7) {
+    if (parseInt(maxscore) > 7 || signalData.core) {
         v2Info = `\n--- MODULES V2.0 ---
 - FVG Confluence : ${signalData.fvg_conf || 'N/A'}
 - EQL Sweep : ${signalData.eql_sweep || 'non'}
-- Delta Volume : ${signalData.delta || 'N/A'}`;
+- Delta Volume : ${signalData.delta || 'N/A'}
+--- PROTECTIONS V2.0 ---
+- RSI Penalty : ${signalData.rsi_penalty || 'non'}
+- HTF/Zone Conflict : ${signalData.htf_zone_penalty || 'non'}
+- Dir Mode : ${signalData.dir_mode || '?'}
+--- SCORING ---
+- Core max : ${core} critères CORE actifs
+- Min score (seuil) : ${minscore}
+- Score/Core : ${corePct}%`;
     }
 
     const userMessage = `Signal OKI Fusion recu :
@@ -275,7 +316,7 @@ function callClaude(signalData) {
 - Prix actuel : ${signalData.price || signalData.entry || '?'}
 - Biais HTF : ${signalData.bias || '?'}
 - Zone : ${signalData.zone || '?'}
-- Score : ${signalData.score || '?'}/${maxscore} (${scorePct}%)
+- Score : ${signalData.score || '?'}/${maxscore} (${scorePct}% display)
 - Structure (Trend) : ${signalData.struct || '?'}
 - Kill Zone : ${signalData.kz || '?'}
 - RSI : ${signalData.rsi || '?'}
@@ -358,6 +399,8 @@ function formatVerdict(analysis, data) {
     const pair = data.pair || '?';
     const tf = data.tf || '?';
     const maxscore = data.maxscore || '7';
+    const core = data.core || maxscore;
+    const minscore = data.minscore || '?';
     const score = data.score || '?';
     const biasStr = data.bias_str || '?';
 
@@ -382,22 +425,36 @@ function formatVerdict(analysis, data) {
     const rr = data.rr || '';
     const rrBadge = rr ? ` | ${rr}R` : '';
 
-    // V2.0 badges
+    // V2.0 badges — FVG conf now sends OUI/NON from Pine
     let v2Badges = '';
-    if (parseInt(maxscore) > 7) {
+    if (data.core || parseInt(maxscore) > 7) {
         const fvg = (data.fvg_conf || '').toUpperCase();
         const eql = (data.eql_sweep || '').toLowerCase();
         const delta = (data.delta || '').toUpperCase();
-        if (fvg === 'BULL' || fvg === 'BEAR') v2Badges += ' 📐FVG';
+        if (fvg === 'OUI' || fvg === 'BULL' || fvg === 'BEAR') v2Badges += ' 📐FVG';
         if (eql !== 'non' && eql !== '' && eql !== '?') v2Badges += ' 💰EQL';
         if (delta.includes('BULL') || delta.includes('BEAR')) v2Badges += ' 📊ΔV';
     }
 
-    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}${v2Badges}${rrBadge}
+    // V2.0 penalty badges
+    let penaltyBadges = '';
+    const rsiPen = (data.rsi_penalty || '').toLowerCase();
+    const htfPen = (data.htf_zone_penalty || '').toLowerCase();
+    if (rsiPen === 'oui' || rsiPen === 'yes' || rsiPen === 'true') penaltyBadges += ' ⚡RSI';
+    if (htfPen === 'oui' || htfPen === 'yes' || htfPen === 'true') penaltyBadges += ' ⛔HTF';
+
+    // Dir Mode badge
+    const dirMode = data.dir_mode || '';
+    const dirBadge = dirMode && dirMode !== '?' ? ` 🧭${dirMode}` : '';
+
+    // Core scoring info
+    const coreInfo = data.core ? ` | core:${core} min:${minscore}` : '';
+
+    return `${verdictEmoji} *OKI VERDICT: ${verdictText}${grade}*${oprBadge}${freshBadge}${v2Badges}${penaltyBadges}${dirBadge}${rrBadge}
 
 ${analysis}
 
-_Signal: ${dir} ${pair} ${tf} | Score ${score}/${maxscore} | Bias ${biasStr}/4_`;
+_Signal: ${dir} ${pair} ${tf} | Score ${score}/${maxscore}${coreInfo} | Bias ${biasStr}/4_`;
 }
 
 function formatBlocked(reason, data) {
@@ -406,13 +463,15 @@ function formatBlocked(reason, data) {
     const tf = data.tf || '?';
     const score = data.score || '?';
     const maxscore = data.maxscore || '7';
+    const core = data.core || '';
+    const coreInfo = core ? ` (core:${core})` : '';
 
     return `🚫 *SIGNAL BLOQUÉ*
 
 ${reason}
 
-_Signal: ${dir} ${pair} ${tf} — Score ${score}/${maxscore}_
-_Filtre V4.0 actif — signal rejeté avant analyse Claude_`;
+_Signal: ${dir} ${pair} ${tf} — Score ${score}/${maxscore}${coreInfo}_
+_Filtre V4.1 CORE+BONUS actif — signal rejeté avant analyse Claude_`;
 }
 
 function formatFallback(data) {
@@ -425,8 +484,10 @@ function formatFallback(data) {
     const zone = data.zone || '?';
     const score = data.score || '?';
     const maxscore = data.maxscore || '7';
+    const core = data.core || '';
+    const coreInfo = core ? ` (core:${core})` : '';
 
-    return `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/${maxscore}
+    return `${emoji} *${dir} ${pair} ${tf}* — Score ${score}/${maxscore}${coreInfo}
 
 Prix: \`${price}\`
 Biais HTF: ${bias}
@@ -593,9 +654,10 @@ const server = http.createServer(async (req, res) => {
         const journal = readJournal();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            status: 'Oki Alerts V4.0 actif — Fusion v2.0 + Trade Journal',
-            version: '4.0',
-            scoring: 'Dynamique /7 /8 /9 /10 — min 60%',
+            status: 'Oki Alerts V4.1 actif — Fusion v2.0 CORE+BONUS + Trade Journal',
+            version: '4.1',
+            scoring: 'CORE+BONUS — seuil 50% sur CORE uniquement, bonus = FVG/EQL/Delta',
+            protections: 'RSI Penalty, HTF/Zone Conflict, Dir Mode AUTO',
             modules_v2: 'FVG Confluence, EQL Pool, Delta Volume',
             journal_entries: journal.length,
             claude: ANTHROPIC_API_KEY ? 'configuré' : 'PAS CONFIGURE',
@@ -724,7 +786,7 @@ Signaux totaux: *${stats.total}*
 ├ Winners: ${stats.avgScoreWin}%
 ├ Losers: ${stats.avgScoreLoss}%
 
-_Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
+_Rapport OKI V4.1 CORE+BONUS — ${new Date().toISOString().split('T')[0]}_`;
 
         try {
             await sendTelegram(msg);
@@ -749,8 +811,10 @@ _Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
                 const pair = data.pair || '?';
                 const score = data.score || '?';
                 const maxscore = data.maxscore || '7';
+                const core = data.core || '';
+                const coreLog = core ? ` core:${core}` : '';
 
-                console.log(`[${new Date().toISOString()}] Type: ${alertType} | ${dir} ${pair} Score ${score}/${maxscore}`);
+                console.log(`[${new Date().toISOString()}] Type: ${alertType} | ${dir} ${pair} Score ${score}/${maxscore}${coreLog}`);
 
                 // ── Surveillance ──
                 if (alertType === 'htf_flip') {
@@ -766,7 +830,7 @@ _Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
                     return;
                 }
 
-                // ── Filtre dur V4.0 ──
+                // ── Filtre dur V4.1 CORE+BONUS ──
                 const filter = hardFilter(data);
                 if (filter.blocked) {
                     console.log(`[BLOQUÉ] ${filter.reason}`);
@@ -779,14 +843,14 @@ _Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
                     }
 
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, version: 'v4.0', blocked: true, reason: filter.reason }));
+                    res.end(JSON.stringify({ ok: true, version: 'v4.1', blocked: true, reason: filter.reason }));
                     return;
                 }
 
                 // ── Analyse Claude ──
                 let verdict = 'FALLBACK';
                 if (ANTHROPIC_API_KEY) {
-                    console.log(`Signal validé (${score}/${maxscore}) — analyse Claude...`);
+                    console.log(`Signal validé (${score}/${maxscore}${coreLog}) — analyse Claude...`);
                     const analysis = await callClaude(data);
 
                     if (analysis) {
@@ -807,7 +871,7 @@ _Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
                 logTrade(data, verdict, false, '');
 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: true, version: 'v4.0', verdict }));
+                res.end(JSON.stringify({ ok: true, version: 'v4.1', verdict }));
             } catch (err) {
                 console.error('Erreur:', err.message);
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -821,15 +885,17 @@ _Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
     if (req.method === 'GET' && req.url === '/test') {
         const testData = {
             signal: 'BUY', pair: 'XAUUSD', tf: '15', price: '2650.50',
-            bias: 'BULLISH', zone: 'DISCOUNT', score: '8', maxscore: '10',
+            bias: 'BULLISH', zone: 'DISCOUNT', score: '6', maxscore: '10',
+            core: '7', minscore: '4',
             struct: 'BULL', kz: 'NEW_YORK', rsi: '42',
             ob_actifs: '3', ob_testes: '1', ob_fresh: '85', ob_retests: '0',
             bias_dir: 'BULL', bias_str: '3', opr_sweep: 'LOW', atr: '12.50',
-            fvg_conf: 'BULL', eql_sweep: 'HIGH', delta: 'BULL 15.2K',
+            fvg_conf: 'OUI', eql_sweep: 'HIGH', delta: 'BULL 15.2K',
+            rsi_penalty: 'non', htf_zone_penalty: 'non', dir_mode: 'AUTO',
             sl: '2635.50', tp1: '2688.00', tp2: '2706.50', rr: '4.1'
         };
 
-        console.log('[TEST] Simulation signal Fusion v2.0 BUY XAUUSD 8/10...');
+        console.log('[TEST] Simulation signal Fusion v2.0 CORE+BONUS BUY XAUUSD 6/10 (core:7 min:4)...');
         const filter = hardFilter(testData);
         if (filter.blocked) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -904,10 +970,11 @@ _Rapport OKI V4.0 — ${new Date().toISOString().split('T')[0]}_`;
 server.listen(PORT, () => {
     const journal = readJournal();
     console.log('========================================');
-    console.log('  OKI ALERTS V4.0 — Fusion v2.0 + Trade Journal');
+    console.log('  OKI ALERTS V4.1 — Fusion v2.0 CORE+BONUS');
     console.log('========================================');
     console.log(`Port: ${PORT}`);
-    console.log(`Scoring: Dynamique /7 /8 /9 /10 — min 60%`);
+    console.log(`Scoring: CORE+BONUS — seuil 50% sur CORE, bonus = aide`);
+    console.log(`Protections: RSI Penalty, HTF/Zone Conflict, Dir Mode`);
     console.log(`Claude API: ${ANTHROPIC_API_KEY ? 'OK' : 'PAS CONFIGURE'}`);
     console.log(`Telegram: ${TELEGRAM_BOT_TOKEN !== 'TON_TOKEN_ICI' ? 'OK' : 'PAS CONFIGURE'}`);
     console.log(`Journal: ${journal.length} trades enregistrés`);
@@ -918,7 +985,7 @@ server.listen(PORT, () => {
     console.log('  GET  /stats      -> Statistiques (?days=7)');
     console.log('  POST /result     -> Résultat trade {id, result, pnl, notes}');
     console.log('  GET  /report     -> Rapport Telegram (?days=7)');
-    console.log('  GET  /test       -> Test signal v2.0');
+    console.log('  GET  /test       -> Test signal v2.0 CORE+BONUS');
     console.log('  GET  /test-surv  -> Test surveillance');
     console.log('  POST /test-filter -> Test filtre seul');
     console.log('========================================');
